@@ -118,7 +118,7 @@ class HateClassifier:
             labels = batch["labels"].to(self.device, non_blocking=True)
 
             # Mixed precision context
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type="cuda", enabled=self.use_amp):
                 # Forward Pass through base model (get all hidden states)
                 outputs = self.base_model(
                     input_ids=input_ids,
@@ -243,7 +243,7 @@ class HateClassifier:
                 labels = batch["labels"].to(self.device, non_blocking=True)
 
                 # Mixed precision context for evaluation
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type="cuda", enabled=self.use_amp):
                     # Forward pass through base model (no hidden states needed - more efficient)
                     outputs = self.base_model(
                         input_ids=input_ids,
@@ -424,7 +424,7 @@ class HateClassifier:
                 labels = batch["labels"].to(self.device, non_blocking=True)
 
                 # Mixed precision context for inference
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type="cuda", enabled=self.use_amp):
                     # Forward pass through base model (only request hidden states if needed)
                     outputs = self.base_model(
                         input_ids=input_ids,
