@@ -1,0 +1,472 @@
+import torch
+from torch.nn import CrossEntropyLoss
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from transformers import (
+    AutoModel,  # pyright: ignore[reportPrivateImportUsage]
+    AutoConfig,  # pyright: ignore[reportPrivateImportUsage]
+    get_linear_schedule_with_warmup,  # pyright: ignore[reportPrivateImportUsage]
+)
+from transformers.models.bert import BertForSequenceClassification
+from tqdm import tqdm
+import numpy as np
+from TrainingConfig import TrainingConfig
+from sklearn.metrics import f1_score, accuracy_score
+import json
+import os
+from pathlib import Path
+
+
+class HateClassifier:
+    def __init__(self, config: TrainingConfig, **kwargs):
+        self.config = config
+
+        # Initialize device:
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+
+        # Configure & initialize the base model
+        model_config = AutoConfig.from_pretrained(
+            config.model_name, output_attentions=True, output_hidden_states=True
+        )
+        self.base_model = AutoModel.from_pretrained(
+            config.model_name, config=model_config
+        )
+
+        # Get model dimensions
+        hidden_size = self.base_model.config.hidden_size
+        self.num_layers = self.base_model.config.num_hidden_layers
+
+        # Multi-layer classifier heads (one for each transformer layer)
+        self.classifier_list = nn.ModuleList(
+            [nn.Linear(hidden_size, config.num_labels) for _ in range(self.num_layers)]
+        )
+
+        # Dropout layer
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # Layer configuration for debiasing (similar to BertDistill)
+        self.debias_layer = 3  # Layer index for auxiliary loss
+        self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
+
+        # Move models to device
+        self.base_model.to(self.device)
+        self.classifier_list.to(self.device)
+
+        # TODO: Dropout configuration later
+
+        # TODO: Expand custom classifier head to prevent overfitting
+
+        # Configure loss function
+        if config.class_weighting:
+            class_weight = kwargs.get("class_weight")
+            if class_weight:
+                class_weight = class_weight.to(self.device)
+                self.cls_criterion = CrossEntropyLoss(weight=class_weight)
+            else:
+                raise Exception("class_weight not found!")
+        else:
+            self.cls_criterion = CrossEntropyLoss()
+
+        # Configure optimizer (for base model and all classifiers)
+        params = list(self.base_model.parameters()) + list(
+            self.classifier_list.parameters()
+        )
+        self.optimizer = AdamW(params, lr=config.learning_rate)
+
+        # Learning rate scheduler
+        self.scheduler = None
+
+        # Training history
+        self.history = {
+            "train_loss": [],
+            "val_loss": [],
+            "val_accuracy": [],
+            "val_f1": [],
+        }
+
+        # TODO: Dynamic scheduler for optimizer loss
+
+        # TODO: Attention training configuration
+
+    def train_epoch(self, train_dataloader):
+        self.base_model.train()
+        for classifier in self.classifier_list:
+            classifier.train()
+
+        total_loss = 0
+        total_cls_loss = 0
+        total_lower_loss = 0
+        num_batches = 0
+
+        progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
+        for batch in progress_bar:
+            # Reset Gradients
+            self.optimizer.zero_grad()
+
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = batch["labels"].to(self.device)
+
+            # Forward Pass through base model (get all hidden states)
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+
+            # Get hidden states from all layers
+            hidden_states = outputs.hidden_states  # Tuple of (num_layers+1) tensors
+
+            # Apply pooling to each layer's hidden state (extract CLS token)
+            # Note: hidden_states[0] is embeddings, hidden_states[1:] are transformer layers
+            pooled_outputs = []
+            for i in range(1, len(hidden_states)):  # Skip embeddings layer
+                cls_token = hidden_states[i][:, 0, :]  # Get CLS token
+                pooled_outputs.append(cls_token)
+
+            # Get logits from all classifier heads
+            logits_list = []
+            for i, pooled_output in enumerate(pooled_outputs):
+                if i == len(pooled_outputs) - 1 and self.use_multi_layer_loss:
+                    # Last layer: add residual connection from debias layer
+                    combined = (
+                        self.dropout(pooled_output)
+                        + self.dropout(pooled_outputs[self.debias_layer]).detach()
+                    )
+                    logits = self.classifier_list[i](combined)
+                else:
+                    logits = self.classifier_list[i](self.dropout(pooled_output))
+                logits_list.append(logits)
+
+            # Main logits from final layer
+            final_logits = logits_list[-1]
+
+            if self.use_multi_layer_loss:
+                # Multi-layer loss (similar to BertDistill)
+                # Lower layer loss (auxiliary)
+                lower_loss = self.cls_criterion(logits_list[self.debias_layer], labels)
+
+                # Upper layer loss (final)
+                upper_loss = self.cls_criterion(logits_list[-1], labels)
+
+                # Combined loss
+                loss = 0.5 * lower_loss + 0.5 * upper_loss
+
+                total_lower_loss += lower_loss.item()
+                total_cls_loss += upper_loss.item()
+            else:
+                # Single loss from final layer only
+                loss = self.cls_criterion(final_logits, labels)
+                total_cls_loss += loss.item()
+
+            # TODO: Implement attention loss
+
+            total_loss += loss.item()
+            num_batches += 1
+
+            loss.backward()
+            self.optimizer.step()
+
+            if self.scheduler:
+                self.scheduler.step()
+
+            if self.use_multi_layer_loss:
+                progress_bar.set_postfix(
+                    {
+                        "total_loss": total_loss / num_batches,
+                        "upper_loss": total_cls_loss / num_batches,
+                        "lower_loss": total_lower_loss / num_batches,
+                    }
+                )
+            else:
+                progress_bar.set_postfix({"loss": total_loss / num_batches})
+
+        return total_loss / num_batches
+
+    def evaluate(self, val_dataloader):
+        self.base_model.eval()
+        for classifier in self.classifier_list:
+            classifier.eval()
+
+        total_loss = 0
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for batch in tqdm(val_dataloader, desc="Evaluating", unit="batch"):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                # Forward pass through base model
+                outputs = self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+
+                # Get final layer's CLS token (for evaluation, only use final classifier)
+                final_hidden_state = outputs.hidden_states[-1]
+                cls_token = final_hidden_state[:, 0, :]
+
+                # Get logits from final classifier
+                logits = self.classifier_list[-1](self.dropout(cls_token))
+
+                # Calculate loss
+                loss = self.cls_criterion(logits, labels)
+                total_loss += loss.item()
+
+                # Get predictions
+                preds = torch.argmax(logits, dim=1).cpu().numpy()
+
+                # Store predictions and labels
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
+
+        # Calculate metrics
+        accuracy = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average="macro")
+
+        # Calculate loss
+        avg_loss = total_loss / len(val_dataloader)
+
+        return avg_loss, accuracy, f1
+
+    def train(self, train_dataloader, val_dataloader):
+        """Train the model and track metrics history."""
+        print(f"Training on device: {self.device}")
+        print(f"Model: {self.config.model_name}")
+        print(f"Epochs: {self.config.num_epochs}")
+        print(f"Learning rate: {self.config.learning_rate}")
+        print("=" * 60)
+
+        best_f1 = 0.0
+
+        for epoch in range(self.config.num_epochs):
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+
+            # Train for one epoch
+            train_loss = self.train_epoch(train_dataloader)
+
+            # Evaluate on validation set
+            val_loss, val_accuracy, val_f1 = self.evaluate(val_dataloader)
+
+            # Store metrics in history
+            self.history["train_loss"].append(train_loss)
+            self.history["val_loss"].append(val_loss)
+            self.history["val_accuracy"].append(val_accuracy)
+            self.history["val_f1"].append(val_f1)
+
+            # Print epoch summary
+            print(f"\nEpoch {epoch + 1} Summary:")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Val Loss:   {val_loss:.4f}")
+            print(f"  Val Acc:    {val_accuracy:.4f}")
+            print(f"  Val F1:     {val_f1:.4f}")
+
+            # Save best model
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                self.save_model("best_model")
+                print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
+
+            # Save checkpoint every epoch
+            self.save_model(f"checkpoint_epoch_{epoch + 1}")
+
+        # Save final model and training history
+        self.save_model("final_model")
+        self.save_history()
+
+        print("\n" + "=" * 60)
+        print(f"Training completed!")
+        print(f"Best F1 Score: {best_f1:.4f}")
+        print(
+            f"Training history saved to: {self.config.save_dir}/training_history.json"
+        )
+
+        return self.history
+
+    def save_model(self, name: str):
+        """Save model checkpoint."""
+        save_path = Path(self.config.save_dir) / name
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        # Save base model
+        self.base_model.save_pretrained(save_path)
+
+        # Save all classifier heads and optimizer state
+        torch.save(
+            {
+                "classifier_list_state_dict": self.classifier_list.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "config": self.config,
+            },
+            save_path / "training_state.pt",
+        )
+
+    def load_model(self, name: str):
+        """Load model checkpoint."""
+        load_path = Path(self.config.save_dir) / name
+
+        # Load base model
+        self.base_model = AutoModel.from_pretrained(load_path)
+        self.base_model.to(self.device)
+
+        # Load all classifier heads and optimizer state
+        checkpoint = torch.load(load_path / "training_state.pt")
+        self.classifier_list.load_state_dict(checkpoint["classifier_list_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        print(f"Model loaded from: {load_path}")
+
+    def save_history(self):
+        """Save training history to JSON file."""
+        save_path = Path(self.config.save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        history_path = save_path / "training_history.json"
+        with open(history_path, "w") as f:
+            json.dump(self.history, f, indent=2)
+
+    def load_history(self):
+        """Load training history from JSON file."""
+        history_path = Path(self.config.save_dir) / "training_history.json"
+
+        if history_path.exists():
+            with open(history_path, "r") as f:
+                self.history = json.load(f)
+            print(f"Training history loaded from: {history_path}")
+        else:
+            print(f"No training history found at: {history_path}")
+
+    def predict(self, test_dataloader, return_layer_outputs=False):
+        """
+        Run inference on test data and return predictions with metrics.
+
+        Args:
+            test_dataloader: DataLoader for test data
+            return_layer_outputs: If True, returns predictions from all layers
+
+        Returns:
+            dict: Contains predictions, true labels, probabilities, loss, accuracy, and F1 score
+        """
+        self.base_model.eval()
+        for classifier in self.classifier_list:
+            classifier.eval()
+
+        total_loss = 0
+        all_preds = []
+        all_labels = []
+        all_probs = []
+        all_layer_preds = (
+            [[] for _ in range(self.num_layers)] if return_layer_outputs else None
+        )
+
+        print(f"Running inference on {len(test_dataloader)} batches...")
+
+        with torch.no_grad():
+            for batch in tqdm(test_dataloader, desc="Testing", unit="batch"):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                # Forward pass through base model
+                outputs = self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+
+                # Get final layer's CLS token
+                final_hidden_state = outputs.hidden_states[-1]
+                cls_token = final_hidden_state[:, 0, :]
+
+                # Get logits from final classifier
+                logits = self.classifier_list[-1](self.dropout(cls_token))
+
+                # Calculate loss
+                loss = self.cls_criterion(logits, labels)
+                total_loss += loss.item()
+
+                # Get predictions and probabilities
+                probs = F.softmax(logits, dim=1)
+                preds = torch.argmax(logits, dim=1)
+
+                # Store predictions, labels, and probabilities
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+                # Optionally get predictions from all layers
+                if return_layer_outputs:
+                    hidden_states = outputs.hidden_states[1:]  # Skip embeddings
+                    for i, hidden_state in enumerate(hidden_states):
+                        layer_cls = hidden_state[:, 0, :]
+                        layer_logits = self.classifier_list[i](self.dropout(layer_cls))
+                        layer_preds = torch.argmax(layer_logits, dim=1)
+                        all_layer_preds[i].extend(layer_preds.cpu().numpy())
+
+        # Convert to numpy arrays
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        all_probs = np.array(all_probs)
+
+        # Calculate metrics
+        accuracy = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average="macro")
+        avg_loss = total_loss / len(test_dataloader)
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("Test Results:")
+        print(f"  Test Loss:     {avg_loss:.4f}")
+        print(f"  Test Accuracy: {accuracy:.4f}")
+        print(f"  Test F1:       {f1:.4f}")
+        print("=" * 60)
+
+        results = {
+            "predictions": all_preds,
+            "labels": all_labels,
+            "probabilities": all_probs,
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "f1": f1,
+        }
+
+        if return_layer_outputs:
+            results["layer_predictions"] = [
+                np.array(preds) for preds in all_layer_preds
+            ]
+
+        return results
+
+    def save_predictions(self, results: dict, filename: str = "test_results.json"):
+        """
+        Save prediction results to file.
+
+        Args:
+            results: Dictionary returned from predict() method
+            filename: Name of the file to save results
+        """
+        save_path = Path(self.config.save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        # Convert numpy arrays to lists for JSON serialization
+        results_serializable = {
+            "predictions": results["predictions"].tolist(),
+            "labels": results["labels"].tolist(),
+            "probabilities": results["probabilities"].tolist(),
+            "loss": float(results["loss"]),
+            "accuracy": float(results["accuracy"]),
+            "f1": float(results["f1"]),
+        }
+
+        results_path = save_path / filename
+        with open(results_path, "w") as f:
+            json.dump(results_serializable, f, indent=2)
+
+        print(f"Test results saved to: {results_path}")
