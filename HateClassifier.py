@@ -56,10 +56,6 @@ class HateClassifier:
         self.base_model.to(self.device)
         self.classifier_list.to(self.device)
 
-        # TODO: Dropout configuration later
-
-        # TODO: Expand custom classifier head to prevent overfitting
-
         # Configure loss function
         if config.class_weighting:
             class_weight = kwargs.get("class_weight")
@@ -87,10 +83,6 @@ class HateClassifier:
             "val_accuracy": [],
             "val_f1": [],
         }
-
-        # TODO: Dynamic scheduler for optimizer loss
-
-        # TODO: Attention training configuration
 
     def train_epoch(self, train_dataloader):
         self.base_model.train()
