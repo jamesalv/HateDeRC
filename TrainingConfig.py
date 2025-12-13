@@ -18,8 +18,18 @@ class TrainingConfig:
     num_epochs: int = 2
     train_attention: bool = True
     use_multi_layer_loss = False
-    hidden_dropout_prob=0
-    
+    hidden_dropout_prob = 0
+
+    # Optimization Parameters
+    use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)
+    gradient_accumulation_steps: int = (
+        1  # Effective batch_size = batch_size * accumulation_steps
+    )
+    max_grad_norm: float = 1.0  # Gradient clipping threshold
+    num_workers: int = 4  # DataLoader workers (0 for Windows, 4+ for Linux)
+    pin_memory: bool = True  # Pin memory for faster GPU transfer
+    use_compile: bool = False  # PyTorch 2.0+ compile (can provide 10-30% speedup)
+
     # Other Parameters
     seed: int = 42
     save_dir: str = "./checkpoints"

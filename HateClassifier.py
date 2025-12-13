@@ -3,6 +3,7 @@ from torch.nn import CrossEntropyLoss
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.amp import autocast, GradScaler  # type: ignore
 from transformers import (
     AutoModel,  # pyright: ignore[reportPrivateImportUsage]
     AutoConfig,  # pyright: ignore[reportPrivateImportUsage]
@@ -76,6 +77,22 @@ class HateClassifier:
         # Learning rate scheduler
         self.scheduler = None
 
+        # Mixed precision training
+        self.use_amp = config.use_amp and torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_amp else None
+
+        # Gradient accumulation
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
+        self.max_grad_norm = config.max_grad_norm
+
+        # Torch compile (PyTorch 2.0+)
+        if hasattr(config, "use_compile") and config.use_compile:
+            try:
+                self.base_model = torch.compile(self.base_model)
+                print("✓ Model compiled with torch.compile")
+            except Exception as e:
+                print(f"Warning: torch.compile failed: {e}")
+
         # Training history
         self.history = {
             "train_loss": [],
@@ -95,76 +112,105 @@ class HateClassifier:
         num_batches = 0
 
         progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
-        for batch in progress_bar:
-            # Reset Gradients
-            self.optimizer.zero_grad()
+        for batch_idx, batch in enumerate(progress_bar):
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
 
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            # Mixed precision context
+            with autocast(enabled=self.use_amp):
+                # Forward Pass through base model (get all hidden states)
+                outputs = self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
 
-            # Forward Pass through base model (get all hidden states)
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
+                # Get hidden states from all layers
+                hidden_states = outputs.hidden_states  # Tuple of (num_layers+1) tensors
 
-            # Get hidden states from all layers
-            hidden_states = outputs.hidden_states  # Tuple of (num_layers+1) tensors
+                # Apply pooling to each layer's hidden state (extract CLS token)
+                # Note: hidden_states[0] is embeddings, hidden_states[1:] are transformer layers
+                pooled_outputs = []
+                for i in range(1, len(hidden_states)):  # Skip embeddings layer
+                    cls_token = hidden_states[i][:, 0, :]  # Get CLS token
+                    pooled_outputs.append(cls_token)
 
-            # Apply pooling to each layer's hidden state (extract CLS token)
-            # Note: hidden_states[0] is embeddings, hidden_states[1:] are transformer layers
-            pooled_outputs = []
-            for i in range(1, len(hidden_states)):  # Skip embeddings layer
-                cls_token = hidden_states[i][:, 0, :]  # Get CLS token
-                pooled_outputs.append(cls_token)
+                # Get logits from all classifier heads
+                logits_list = []
+                for i, pooled_output in enumerate(pooled_outputs):
+                    if i == len(pooled_outputs) - 1 and self.use_multi_layer_loss:
+                        # Last layer: add residual connection from debias layer
+                        combined = (
+                            self.dropout(pooled_output)
+                            + self.dropout(pooled_outputs[self.debias_layer]).detach()
+                        )
+                        logits = self.classifier_list[i](combined)
+                    else:
+                        logits = self.classifier_list[i](self.dropout(pooled_output))
+                    logits_list.append(logits)
 
-            # Get logits from all classifier heads
-            logits_list = []
-            for i, pooled_output in enumerate(pooled_outputs):
-                if i == len(pooled_outputs) - 1 and self.use_multi_layer_loss:
-                    # Last layer: add residual connection from debias layer
-                    combined = (
-                        self.dropout(pooled_output)
-                        + self.dropout(pooled_outputs[self.debias_layer]).detach()
+                # Main logits from final layer
+                final_logits = logits_list[-1]
+
+                if self.use_multi_layer_loss:
+                    # Multi-layer loss (similar to BertDistill)
+                    # Lower layer loss (auxiliary)
+                    lower_loss = self.cls_criterion(
+                        logits_list[self.debias_layer], labels
                     )
-                    logits = self.classifier_list[i](combined)
+
+                    # Upper layer loss (final)
+                    upper_loss = self.cls_criterion(logits_list[-1], labels)
+
+                    # Combined loss
+                    loss = 0.5 * lower_loss + 0.5 * upper_loss
+
+                    total_lower_loss += lower_loss.item()
+                    total_cls_loss += upper_loss.item()
                 else:
-                    logits = self.classifier_list[i](self.dropout(pooled_output))
-                logits_list.append(logits)
+                    # Single loss from final layer only
+                    loss = self.cls_criterion(final_logits, labels)
+                    total_cls_loss += loss.item()
 
-            # Main logits from final layer
-            final_logits = logits_list[-1]
+                # Scale loss for gradient accumulation
+                loss = loss / self.gradient_accumulation_steps
 
-            if self.use_multi_layer_loss:
-                # Multi-layer loss (similar to BertDistill)
-                # Lower layer loss (auxiliary)
-                lower_loss = self.cls_criterion(logits_list[self.debias_layer], labels)
-
-                # Upper layer loss (final)
-                upper_loss = self.cls_criterion(logits_list[-1], labels)
-
-                # Combined loss
-                loss = 0.5 * lower_loss + 0.5 * upper_loss
-
-                total_lower_loss += lower_loss.item()
-                total_cls_loss += upper_loss.item()
-            else:
-                # Single loss from final layer only
-                loss = self.cls_criterion(final_logits, labels)
-                total_cls_loss += loss.item()
-
-            # TODO: Implement attention loss
-
-            total_loss += loss.item()
+            total_loss += loss.item() * self.gradient_accumulation_steps
             num_batches += 1
 
-            loss.backward()
-            self.optimizer.step()
+            # Backward pass with gradient scaling
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-            if self.scheduler:
-                self.scheduler.step()
+            # Gradient accumulation: only step optimizer every N batches
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.base_model.parameters(), self.max_grad_norm
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        self.classifier_list.parameters(), self.max_grad_norm
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.base_model.parameters(), self.max_grad_norm
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        self.classifier_list.parameters(), self.max_grad_norm
+                    )
+                    self.optimizer.step()
+
+                self.optimizer.zero_grad()
+
+                if self.scheduler:
+                    self.scheduler.step()
 
             if self.use_multi_layer_loss:
                 progress_bar.set_postfix(
@@ -190,27 +236,29 @@ class HateClassifier:
 
         with torch.no_grad():
             for batch in tqdm(val_dataloader, desc="Evaluating", unit="batch"):
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = batch["labels"].to(self.device)
-
-                # Forward pass through base model
-                outputs = self.base_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
+                input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(
+                    self.device, non_blocking=True
                 )
+                labels = batch["labels"].to(self.device, non_blocking=True)
 
-                # Get final layer's CLS token (for evaluation, only use final classifier)
-                final_hidden_state = outputs.hidden_states[-1]
-                cls_token = final_hidden_state[:, 0, :]
+                # Mixed precision context for evaluation
+                with autocast(enabled=self.use_amp):
+                    # Forward pass through base model (no hidden states needed - more efficient)
+                    outputs = self.base_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
 
-                # Get logits from final classifier
-                logits = self.classifier_list[-1](self.dropout(cls_token))
+                    # Get final layer's CLS token (for evaluation, only use final classifier)
+                    cls_token = outputs.last_hidden_state[:, 0, :]
 
-                # Calculate loss
-                loss = self.cls_criterion(logits, labels)
-                total_loss += loss.item()
+                    # Get logits from final classifier (no dropout in eval mode)
+                    logits = self.classifier_list[-1](cls_token)
+
+                    # Calculate loss
+                    loss = self.cls_criterion(logits, labels)
+                    total_loss += loss.item()
 
                 # Get predictions
                 preds = torch.argmax(logits, dim=1).cpu().numpy()
@@ -233,7 +281,14 @@ class HateClassifier:
         print(f"Training on device: {self.device}")
         print(f"Model: {self.config.model_name}")
         print(f"Epochs: {self.config.num_epochs}")
+        print(f"Batch size: {self.config.batch_size}")
+        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
+        print(
+            f"Effective batch size: {self.config.batch_size * self.gradient_accumulation_steps}"
+        )
         print(f"Learning rate: {self.config.learning_rate}")
+        print(f"Mixed precision (AMP): {self.use_amp}")
+        print(f"Gradient clipping: {self.max_grad_norm}")
         print("=" * 60)
 
         best_f1 = 0.0
@@ -362,31 +417,38 @@ class HateClassifier:
 
         with torch.no_grad():
             for batch in tqdm(test_dataloader, desc="Testing", unit="batch"):
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = batch["labels"].to(self.device)
-
-                # Forward pass through base model
-                outputs = self.base_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
+                input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(
+                    self.device, non_blocking=True
                 )
+                labels = batch["labels"].to(self.device, non_blocking=True)
 
-                # Get final layer's CLS token
-                final_hidden_state = outputs.hidden_states[-1]
-                cls_token = final_hidden_state[:, 0, :]
+                # Mixed precision context for inference
+                with autocast(enabled=self.use_amp):
+                    # Forward pass through base model (only request hidden states if needed)
+                    outputs = self.base_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=return_layer_outputs,
+                    )
 
-                # Get logits from final classifier
-                logits = self.classifier_list[-1](self.dropout(cls_token))
+                    # Get final layer's CLS token
+                    if return_layer_outputs:
+                        final_hidden_state = outputs.hidden_states[-1]
+                        cls_token = final_hidden_state[:, 0, :]
+                    else:
+                        cls_token = outputs.last_hidden_state[:, 0, :]
 
-                # Calculate loss
-                loss = self.cls_criterion(logits, labels)
-                total_loss += loss.item()
+                    # Get logits from final classifier (no dropout in eval mode)
+                    logits = self.classifier_list[-1](cls_token)
 
-                # Get predictions and probabilities
-                probs = F.softmax(logits, dim=1)
-                preds = torch.argmax(logits, dim=1)
+                    # Calculate loss
+                    loss = self.cls_criterion(logits, labels)
+                    total_loss += loss.item()
+
+                    # Get predictions and probabilities
+                    probs = F.softmax(logits, dim=1)
+                    preds = torch.argmax(logits, dim=1)
 
                 # Store predictions, labels, and probabilities
                 all_preds.extend(preds.cpu().numpy())
@@ -398,7 +460,7 @@ class HateClassifier:
                     hidden_states = outputs.hidden_states[1:]  # Skip embeddings
                     for i, hidden_state in enumerate(hidden_states):
                         layer_cls = hidden_state[:, 0, :]
-                        layer_logits = self.classifier_list[i](self.dropout(layer_cls))
+                        layer_logits = self.classifier_list[i](layer_cls)
                         layer_preds = torch.argmax(layer_logits, dim=1)
                         all_layer_preds[i].extend(layer_preds.cpu().numpy())
 
