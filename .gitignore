@@ -1,5 +1,42 @@
 # *.ipynb
-*.md
-checkpoints/
 __pycache__
 Data/explanations/
+
+# Old checkpoint system (keep for legacy)
+checkpoints/
+Data/*.md
+
+# Experiment Management System
+# Exclude large model files and results
+experiments/*/checkpoints/*.safetensors
+experiments/*/checkpoints/*.pt
+experiments/*/results/*.pkl
+experiments/*/logs/*.log
+
+# Keep these (important metadata, small files)
+!experiments/*/config.json
+!experiments/*/metrics/*.json
+!experiments/experiment_registry.json
+
+# Python
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep documentation now that we have proper experiment tracking
+!EXPERIMENT_MANAGEMENT.md
+!README.md
