@@ -410,6 +410,7 @@ class HateClassifier:
         all_labels = []
         all_probs = []
         all_attention_weights = []
+        all_post_ids = []
         all_layer_preds = (
             [[] for _ in range(self.num_layers)] if return_layer_outputs else None
         )
@@ -423,6 +424,7 @@ class HateClassifier:
                     self.device, non_blocking=True
                 )
                 labels = batch["labels"].to(self.device, non_blocking=True)
+                post_id = batch["post_id"]
 
                 # Mixed precision context for inference
                 with autocast(device_type="cuda", enabled=self.use_amp):
@@ -449,6 +451,7 @@ class HateClassifier:
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
                 all_probs.extend(probs.cpu().numpy())
+                all_post_ids.extend(post_id)
                 # Store attentions if requested
                 if return_attentions:
                     attention_result = self.extract_attention(outputs.attentions)
@@ -485,6 +488,7 @@ class HateClassifier:
         print("=" * 60)
 
         results = {
+            'post_ids': all_post_ids,
             "predictions": all_preds,
             "labels": all_labels,
             "probabilities": all_probs,

@@ -2,3 +2,4 @@
 *.md
 checkpoints/
 __pycache__
+Data/explanations/

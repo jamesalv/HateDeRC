@@ -13,6 +13,7 @@ class HateDataset(Dataset):
         item = self.data[idx]
 
         return {
+            'post_id': item['post_id'],
             "input_ids": item["input_ids"].flatten(),
             "attention_mask": item["attention_mask"].flatten(),
             "rationales": item["rationales"].flatten(),
