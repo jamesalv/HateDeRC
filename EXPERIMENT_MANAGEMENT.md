@@ -5,6 +5,7 @@ A robust system for tracking, organizing, and comparing machine learning experim
 ## Overview
 
 The `ExperimentManager` class provides a systematic way to:
+
 - 📁 Organize all experiment outputs in structured directories
 - 🔖 Track experiment configurations and metadata
 - 📊 Save and compare results across experiments
@@ -42,7 +43,7 @@ experiment_manager.mark_complete(status="completed")
 
 Each experiment creates the following structure:
 
-```
+``` bash
 experiments/
 └── 20241216_143052_baseline_a1b2c3d4/
     ├── config.json                    # Training configuration
@@ -111,6 +112,7 @@ experiment_manager.mark_complete(status="completed")
 ### Experiment ID Generation
 
 Experiment IDs are automatically generated with:
+
 - **Timestamp**: `YYYYMMDD_HHMMSS` format
 - **Custom name**: Your provided name (optional)
 - **Config hash**: Short hash of key config parameters (8 chars)
@@ -184,45 +186,59 @@ experiment_manager.export_experiment(
 ### ExperimentManager
 
 #### `__init__(base_dir="./experiments", registry_file="experiment_registry.json")`
+
 Initialize the experiment manager.
 
 #### `create_experiment(config, custom_name=None, description=None)`
+
 Create a new experiment and return its directory path.
 
 #### `save_training_history(history)`
+
 Save training history (loss, accuracy, etc.).
 
 #### `save_predictions(results, filename="test_predictions.pkl")`
+
 Save model predictions.
 
 #### `save_bias_metrics(gmb_metrics, bias_details)`
+
 Save bias evaluation metrics.
 
 #### `save_xai_metrics(xai_metrics)`
+
 Save XAI/faithfulness metrics.
 
 #### `save_eraser_results(results_path)`
+
 Copy ERASER formatted results to experiment directory.
 
 #### `save_final_metrics(metrics)`
+
 Save comprehensive final metrics summary.
 
 #### `mark_complete(status="completed", notes=None)`
+
 Mark experiment as complete with optional notes.
 
 #### `list_experiments(status=None)`
+
 List all experiments, optionally filtered by status.
 
 #### `print_experiment_summary()`
+
 Print a formatted summary of all experiments.
 
 #### `compare_experiments(experiment_ids)`
+
 Compare configurations and results of multiple experiments.
 
 #### `export_experiment(experiment_id, export_path)`
+
 Export entire experiment directory to specified path.
 
 #### `get_experiment_path(experiment_id)`
+
 Get the path to a specific experiment.
 
 ## Best Practices
@@ -230,6 +246,7 @@ Get the path to a specific experiment.
 ### 1. Naming Conventions
 
 Use descriptive custom names that indicate what you're testing:
+
 - `baseline_distilbert`
 - `multilayer_loss_v1`
 - `high_lr_experiment`
@@ -238,6 +255,7 @@ Use descriptive custom names that indicate what you're testing:
 ### 2. Descriptions
 
 Provide clear descriptions of what each experiment tests:
+
 ```python
 description="Testing impact of higher learning rate (5e-5) on convergence speed"
 ```
@@ -245,6 +263,7 @@ description="Testing impact of higher learning rate (5e-5) on convergence speed"
 ### 3. Status Management
 
 Use consistent status values:
+
 - `"running"` - Experiment in progress
 - `"completed"` - Successfully completed
 - `"failed"` - Failed during execution
@@ -253,6 +272,7 @@ Use consistent status values:
 ### 4. Notes
 
 Add notes when marking experiments complete:
+
 ```python
 experiment_manager.mark_complete(
     status="completed",
@@ -265,6 +285,7 @@ experiment_manager.mark_complete(
 ### Issue: Config save_dir not updating
 
 **Solution**: Ensure you create the experiment BEFORE initializing the model:
+
 ```python
 # ✓ CORRECT
 experiment_dir = experiment_manager.create_experiment(config=config)
@@ -278,6 +299,7 @@ experiment_dir = experiment_manager.create_experiment(config=config)
 ### Issue: Cannot find old experiments
 
 **Solution**: Check the `experiment_registry.json` file is not corrupted. You can manually inspect it:
+
 ```python
 import json
 with open("./experiments/experiment_registry.json", 'r') as f:
@@ -314,6 +336,7 @@ shutil.copytree(old_checkpoint, new_exp_dir / "checkpoints" / "best_model")
 ### Custom Metrics
 
 Add your own metrics to final summary:
+
 ```python
 final_summary = {
     "test_accuracy": 0.89,
@@ -328,6 +351,7 @@ experiment_manager.save_final_metrics(final_summary)
 ### Programmatic Analysis
 
 Load and analyze experiments programmatically:
+
 ```python
 import pandas as pd
 
@@ -356,7 +380,8 @@ print(df.sort_values('f1', ascending=False))
 ## Integration with Git
 
 Add to `.gitignore`:
-```
+
+``` bash
 # Experiment outputs (too large for git)
 experiments/*/checkpoints/
 experiments/*/results/*.pkl
