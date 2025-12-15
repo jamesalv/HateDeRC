@@ -5,7 +5,7 @@ from typing import Optional
 @dataclass
 class TrainingConfig:
     # Model Parameters
-    model_name: str = "bert-base-uncased"
+    model_name: str = "distilbert-base-uncased"
     num_labels: int = 2
 
     # Dataset Parameters
@@ -17,8 +17,8 @@ class TrainingConfig:
     batch_size: int = 32
     num_epochs: int = 2
     train_attention: bool = True
-    use_multi_layer_loss = False
-    hidden_dropout_prob = 0
+    use_multi_layer_loss: bool = False
+    hidden_dropout_prob: float = 0
 
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)

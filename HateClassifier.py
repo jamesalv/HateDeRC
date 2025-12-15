@@ -7,9 +7,7 @@ from torch.amp import autocast, GradScaler  # type: ignore
 from transformers import (
     AutoModel,  # pyright: ignore[reportPrivateImportUsage]
     AutoConfig,  # pyright: ignore[reportPrivateImportUsage]
-    get_linear_schedule_with_warmup,  # pyright: ignore[reportPrivateImportUsage]
 )
-from transformers.models.bert import BertForSequenceClassification
 from tqdm import tqdm
 import numpy as np
 from TrainingConfig import TrainingConfig
@@ -180,7 +178,7 @@ class HateClassifier:
             num_batches += 1
 
             # Backward pass with gradient scaling
-            if self.use_amp:
+            if self.use_amp and self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
@@ -188,7 +186,7 @@ class HateClassifier:
             # Gradient accumulation: only step optimizer every N batches
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 # Gradient clipping
-                if self.use_amp:
+                if self.use_amp and self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.base_model.parameters(), self.max_grad_norm
@@ -390,7 +388,9 @@ class HateClassifier:
         else:
             print(f"No training history found at: {history_path}")
 
-    def predict(self, test_dataloader, return_layer_outputs=False):
+    def predict(
+        self, test_dataloader, return_layer_outputs=False, return_attentions=False
+    ):
         """
         Run inference on test data and return predictions with metrics.
 
@@ -409,6 +409,7 @@ class HateClassifier:
         all_preds = []
         all_labels = []
         all_probs = []
+        all_attention_weights = []
         all_layer_preds = (
             [[] for _ in range(self.num_layers)] if return_layer_outputs else None
         )
@@ -430,16 +431,10 @@ class HateClassifier:
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         output_hidden_states=return_layer_outputs,
+                        output_attentions=return_attentions,
                     )
 
-                    # Get final layer's CLS token
-                    if return_layer_outputs:
-                        final_hidden_state = outputs.hidden_states[-1]
-                        cls_token = final_hidden_state[:, 0, :]
-                    else:
-                        cls_token = outputs.last_hidden_state[:, 0, :]
-
-                    # Get logits from final classifier (no dropout in eval mode)
+                    cls_token = outputs.last_hidden_state[:, 0, :]
                     logits = self.classifier_list[-1](cls_token)
 
                     # Calculate loss
@@ -454,9 +449,16 @@ class HateClassifier:
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
                 all_probs.extend(probs.cpu().numpy())
+                # Store attentions if requested
+                if return_attentions:
+                    attention_result = self.extract_attention(outputs.attentions)
+                    if attention_result is not None:
+                        all_attention_weights.extend(attention_result)
+                    else:
+                        print("No attention weights extracted.")
 
                 # Optionally get predictions from all layers
-                if return_layer_outputs:
+                if return_layer_outputs and all_layer_preds is not None:
                     hidden_states = outputs.hidden_states[1:]  # Skip embeddings
                     for i, hidden_state in enumerate(hidden_states):
                         layer_cls = hidden_state[:, 0, :]
@@ -491,10 +493,13 @@ class HateClassifier:
             "f1": f1,
         }
 
-        if return_layer_outputs:
+        if return_layer_outputs and all_layer_preds is not None:
             results["layer_predictions"] = [
                 np.array(preds) for preds in all_layer_preds
             ]
+
+        if return_attentions:
+            results["attentions"] = all_attention_weights
 
         return results
 
@@ -524,3 +529,19 @@ class HateClassifier:
             json.dump(results_serializable, f, indent=2)
 
         print(f"Test results saved to: {results_path}")
+
+    def extract_attention(self, attentions) -> np.ndarray | None:
+        if attentions is None or len(attentions) == 0:
+            print("WARNING: No attention data available.")
+            return None
+
+        # Take CLS representation from the last layer's attentions
+        last_layer_attentions = attentions[
+            -1
+        ]  # Shape: (batch_size, num_heads, seq_len, seq_len)
+        cls_attentions = last_layer_attentions[
+            :, :, 0, :
+        ]  # Shape: (batch_size, num_heads, seq_len)
+        # Average over all heads
+        avg_cls_attention = cls_attentions.mean(dim=1)  # Shape: (batch_size, seq_len)
+        return avg_cls_attention.cpu().numpy()
