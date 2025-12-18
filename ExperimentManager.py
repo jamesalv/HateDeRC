@@ -335,7 +335,7 @@ class ExperimentManager:
 
         return comparison
 
-    def export_experiment(self, experiment_id: str, export_path: str):
+    def export_experiment(self, experiment_id: str, export_path: Path):
         """Export an entire experiment directory to a specified path."""
         exp_dir = self.get_experiment_path(experiment_id)
         if not exp_dir:
