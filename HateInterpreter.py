@@ -1,383 +1,444 @@
 import numpy as np
 import torch
-from sklearn.metrics import precision_recall_curve, auc, f1_score, precision_score, recall_score
+from torch.utils.data import DataLoader
 from typing import List, Dict, Tuple
-
+import json
+from sklearn.metrics import (
+    precision_recall_curve,
+    auc,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from preprocessing import find_ranges
 
 class HateInterpreter:
     """
-    Minimal implementation of ERASER metrics for research
-    
-    Implements:
-    1. Plausibility: AUPRC (soft), Token F1 (hard)
-    2. Faithfulness: Comprehensiveness, Sufficiency
+    Compute faithfulness metrics using the model's existing predict() method.
+    Creates modified datasets and uses DataLoader for efficient batched processing.
     """
-    
-    def __init__(self, model, tokenizer, device):
+
+    def __init__(self, model, tokenizer, dataset_class, batch_size=32):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
-        
+        self.dataset_class = dataset_class
+        self.batch_size = batch_size
+
+        # Get special token IDs
+        self.special_token_ids = {
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+        }
+        self.special_token_ids = {x for x in self.special_token_ids if x is not None}
+
     def compute_all_metrics(
-        self, 
-        input_ids_list: List[torch.Tensor],  # Already tokenized!
-        attention_masks_list: List[torch.Tensor],  # Attention masks
-        attention_scores: List[np.ndarray],  # Soft scores per token
-        human_rationales: List[torch.Tensor],  # Binary mask per token
-        predicted_classes: List[int],  # Hard predictions
-        original_probs: List[np.ndarray]  # [prob_class_0, prob_class_1, ...]
+        self,
+        test_data: List[Dict],  # Your original test data
+        test_results: Dict,  # Results from prediction
+        k: int = 5,  # Number of top tokens to consider
+        eraser_save_path: str = "Data/eraser_formatted_results.jsonl",
     ) -> Dict[str, float]:
         """
-        Compute all metrics for a dataset
-        
+        Compute all ERASER metrics efficiently using DataLoader approach
+
         Args:
-            input_ids_list: List of input_ids tensors (already tokenized)
-            attention_masks_list: List of attention_mask tensors
-            attention_scores: Attention weights per token (soft scores)
-            human_rationales: Binary masks indicating human rationales
-            predicted_classes: Model's predicted class for each instance
-            original_probs: Model's original class probabilities
-            
+            test_data: List of test instances (each with input_ids, attention_mask, rationales, labels)
+            test_results: List of dictionaries containing attention scores for each instance
+
         Returns:
             Dictionary with all metrics
         """
-        # 1. Calculate average rationale length (for top-k selection)
-        k = self._calculate_average_rationale_length(human_rationales, attention_masks_list)
-        print(f"Using k={k} (average human rationale length)")
-        
+        print("Computing ERASER metrics using DataLoader approach...")
+
+        # Extract lists for easier processing
+        input_ids_list = [item["input_ids"] for item in test_data]
+        attention_masks_list = [item["attention_mask"] for item in test_data]
+        human_rationales = [item["rationales"] for item in test_data]
+        attention_scores = [item for item in test_results["attentions"]]
+
+        # 1. Extract top-k as hard predictions
+        hard_predictions = self._extract_top_k_tokens(
+            attention_scores, attention_masks_list, input_ids_list, k
+        )
+
+        hard_rationale_predictions, soft_rationale_predictions = (
+            self._convert_attention_to_evidence_format(
+                input_ids_list, attention_scores, hard_predictions
+            )
+        )
+
         # 2. PLAUSIBILITY METRICS
-        auprc = self._compute_auprc(attention_scores, human_rationales, attention_masks_list)
-        
-        # Extract top-k tokens as hard predictions
-        hard_predictions = self._extract_top_k_tokens(attention_scores, attention_masks_list, k)
+        print("\n[1/3] Computing plausibility metrics...")
+        auprc = self._compute_auprc(
+            attention_scores, human_rationales, attention_masks_list, input_ids_list
+        )
         token_f1, token_prec, token_rec = self._compute_token_f1(
             hard_predictions, human_rationales, attention_masks_list
         )
-        
+
         # 3. FAITHFULNESS METRICS
-        comp_scores, suff_scores = self._compute_faithfulness(
-            input_ids_list, attention_masks_list, hard_predictions, 
-            predicted_classes, original_probs
+        print("[2/3] Computing comprehensiveness scores...")
+        raw_comprehensiveness, comprehensiveness_scores = (
+            self._compute_comprehensiveness(test_data, test_results, hard_predictions)
         )
-        
-        comprehensiveness = np.mean(comp_scores)
-        sufficiency = np.mean(suff_scores)
-        
+
+        print("[3/3] Computing sufficiency scores...")
+        raw_sufficiency, sufficiency_scores = self._compute_sufficiency(
+            test_data, test_results, hard_predictions
+        )
+
+        # 4. Convert to eraser format
+        results_eraser = self._convert_result_to_eraser_format(
+            test_results,
+            hard_rationale_predictions,
+            soft_rationale_predictions,
+            raw_sufficiency,
+            raw_comprehensiveness,
+        )
+        # Convert to JSONL format
+        jsonl_output = "\n".join([json.dumps(entry) for entry in results_eraser])
+        with open(eraser_save_path, "w") as f:
+            f.write(jsonl_output)
+
         return {
-            # Plausibility (alignment with human rationales)
-            'auprc': auprc,
-            'token_f1': token_f1,
-            'token_precision': token_prec,
-            'token_recall': token_rec,
-            
-            # Faithfulness (model actually used these rationales)
-            'comprehensiveness': comprehensiveness,  # Higher is better
-            'sufficiency': sufficiency,  # Lower is better
-            
-            # Additional info
-            'avg_rationale_length': k,
+            # Plausibility
+            "auprc": auprc,
+            "token_f1": token_f1,
+            "token_precision": token_prec,
+            "token_recall": token_rec,
+            # Faithfulness
+            "comprehensiveness": float(np.mean(comprehensiveness_scores)),
+            "sufficiency": float(np.mean(sufficiency_scores)),
+            # Additional
+            "avg_rationale_length": k,
         }
-    
-    def _calculate_average_rationale_length(
-        self, 
-        human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor]
-    ) -> int:
-        """Calculate average number of rationale tokens (for top-k), excluding padding"""
-        lengths = []
-        for rat, mask in zip(human_rationales, attention_masks_list):
-            # Only count non-padding tokens
-            valid_positions = mask.bool()
-            rat_count = (rat[valid_positions] == 1).sum().item()
-            lengths.append(rat_count)
-        
-        return max(1, int(np.mean(lengths)))  # At least 1
-    
-    def _compute_auprc(
+
+    def _convert_attention_to_evidence_format(
+        self, input_ids_list, attention_scores, hard_predictions
+    ):
+        # 2. Collect evidence
+        hard_rationale_predictions = []
+        for idx, hp in enumerate(hard_predictions):
+            evidences = []
+            indexes = sorted([i for i, each in enumerate(hp.tolist()) if each == 1])
+            for span in find_ranges(indexes):
+                if isinstance(span, int):
+                    start, end = span, span + 1
+                else:
+                    start, end = span[0], span[1] + 1
+
+                evidences.append(
+                    {
+                        "start_token": start,
+                        "end_token": end,
+                    }
+                )
+            hard_rationale_predictions.append(evidences)
+
+        soft_rationale_predictions = []
+        for att in attention_scores:
+            pred = [x for x in att if x > 0]
+            soft_rationale_predictions.append(pred)
+
+        return hard_rationale_predictions, soft_rationale_predictions
+
+    def _convert_result_to_eraser_format(
         self,
-        attention_scores: List[np.ndarray],
+        test_result: Dict,
+        hard_rationale_predictions,
+        soft_rationale_predictions,
+        sufficiency_scores: np.ndarray,
+        comprehensiveness_scores: np.ndarray,
+    ):
+        all_entries = []
+        for idx, data in enumerate(test_result["post_id"]):
+            entry = {
+                "annotation_id": data,
+                "classification": str(int(test_result["predictions"][idx])),
+                "classification_scores": {
+                    0: float(test_result["probabilities"][idx][0]),
+                    1: float(test_result["probabilities"][idx][1]),
+                },
+                "rationales": [
+                    {
+                        "docid": data,
+                        "hard_rationale_predictions": hard_rationale_predictions[idx],
+                        "soft_rationale_predictions": [
+                            float(x) for x in soft_rationale_predictions[idx]
+                        ],
+                    }
+                ],
+                "sufficiency_classification_scores": {
+                    0: float(sufficiency_scores[idx][0]),
+                    1: float(sufficiency_scores[idx][1]),
+                },
+                "comprehensiveness_classification_scores": {
+                    0: float(comprehensiveness_scores[idx][0]),
+                    1: float(comprehensiveness_scores[idx][1]),
+                },
+            }
+            all_entries.append(entry)
+
+        return all_entries
+
+    def _calculate_average_rationale_length(
+        self,
         human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor]
-    ) -> float:
-        """
-        Compute Area Under Precision-Recall Curve for soft scores
-        
-        This measures: "If I rank tokens by attention, do I recover human rationales?"
-        """
-        all_scores = []
-        all_labels = []
-        
-        for attn, rat, mask in zip(attention_scores, human_rationales, attention_masks_list):
-            # Only consider non-padding tokens
-            valid_positions = mask.bool().cpu().numpy()
-            
-            all_scores.extend(attn[valid_positions].tolist())
-            all_labels.extend(rat[valid_positions].cpu().numpy().tolist())
-        
-        # Convert to numpy
-        all_scores = np.array(all_scores)
-        all_labels = np.array(all_labels)
-        
-        # Compute precision-recall curve
-        precision, recall, _ = precision_recall_curve(all_labels, all_scores)
-        
-        # Compute area under curve
-        auprc_score = auc(recall, precision)
-        
-        return auprc_score
-    
+        attention_masks_list: List[torch.Tensor],
+        input_ids_list: List[torch.Tensor],
+    ) -> int:
+        """Calculate average number of content rationale tokens"""
+        lengths = []
+        for idx, (rat, mask) in enumerate(zip(human_rationales, attention_masks_list)):
+            valid_positions = mask.bool().cpu().numpy().flatten()
+
+            # Exclude special tokens
+            input_ids = input_ids_list[idx].cpu().numpy().flatten()
+            is_special = np.isin(input_ids, list(self.special_token_ids))
+            content_positions = valid_positions & ~is_special
+
+            rat_count = (rat.cpu().numpy().flatten()[content_positions] == 1).sum()
+            lengths.append(rat_count)
+
+        return max(1, int(np.mean(lengths)))
+
     def _extract_top_k_tokens(
         self,
         attention_scores: List[np.ndarray],
         attention_masks_list: List[torch.Tensor],
-        k: int
+        input_ids_list: List[torch.Tensor],
+        k: int,
     ) -> List[np.ndarray]:
-        """
-        Extract top-k tokens with highest attention as hard predictions
-        
-        Returns binary masks (1 = rationale, 0 = not rationale)
-        """
+        """Extract top-k content tokens as hard predictions"""
         hard_predictions = []
-        
-        for attn, mask in zip(attention_scores, attention_masks_list):
-            # Create binary mask
+
+        for idx, (attn, mask) in enumerate(zip(attention_scores, attention_masks_list)):
             pred_mask = np.zeros_like(attn, dtype=int)
-            
-            # Only consider non-padding tokens
-            valid_positions = mask.bool().cpu().numpy()
-            valid_attn = attn[valid_positions]
-            
-            if k > 0 and len(valid_attn) > 0:
-                k_actual = min(k, len(valid_attn))
-                # Get top-k indices within valid positions
-                top_k_within_valid = np.argsort(valid_attn)[-k_actual:]
-                
-                # Map back to original positions
-                valid_indices = np.where(valid_positions)[0]
-                top_k_indices = valid_indices[top_k_within_valid]
-                
+            valid_positions = mask.bool().cpu().numpy().flatten()
+
+            # Exclude special tokens
+            input_ids = input_ids_list[idx].cpu().numpy().flatten()
+            is_special = np.isin(input_ids, list(self.special_token_ids))
+            content_positions = valid_positions & ~is_special
+
+            content_attn = attn[content_positions]
+
+            if k > 0 and len(content_attn) > 0:
+                k_actual = min(k, len(content_attn))
+                top_k_within_content = np.argsort(content_attn)[-k_actual:]
+                content_indices = np.where(content_positions)[0]
+                top_k_indices = content_indices[top_k_within_content]
                 pred_mask[top_k_indices] = 1
-            
+
             hard_predictions.append(pred_mask)
-        
+
         return hard_predictions
-    
+
+    def _compute_auprc(
+        self,
+        attention_scores: List[np.ndarray],
+        human_rationales: List[torch.Tensor],
+        attention_masks_list: List[torch.Tensor],
+        input_ids_list: List[torch.Tensor],
+    ) -> float:
+        """Compute AUPRC for soft attention scores"""
+        all_scores = []
+        all_labels = []
+
+        for idx, (attn, rat, mask) in enumerate(
+            zip(attention_scores, human_rationales, attention_masks_list)
+        ):
+            valid_positions = mask.bool().cpu().numpy().flatten()
+
+            # Exclude special tokens
+            input_ids = input_ids_list[idx].cpu().numpy().flatten()
+            is_special = np.isin(input_ids, list(self.special_token_ids))
+            content_positions = valid_positions & ~is_special
+
+            all_scores.extend(attn[content_positions].tolist())
+            all_labels.extend(
+                rat.cpu().numpy().flatten()[content_positions].astype(int).tolist()
+            )
+
+        all_scores = np.array(all_scores, dtype=float)
+        all_labels = np.array(all_labels, dtype=int)
+
+        if len(np.unique(all_labels)) < 2:
+            print(f"Warning: Only one class in labels: {np.unique(all_labels)}")
+            return 0.0
+
+        precision, recall, _ = precision_recall_curve(all_labels, all_scores)
+        return auc(recall, precision)
+
     def _compute_token_f1(
         self,
         hard_predictions: List[np.ndarray],
         human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor]
+        attention_masks_list: List[torch.Tensor],
     ) -> Tuple[float, float, float]:
-        """
-        Compute token-level F1, Precision, Recall
-        
-        Treats each token as binary classification problem
-        """
+        """Compute token-level F1, Precision, Recall"""
         all_preds = []
         all_labels = []
-        
-        for pred, rat, mask in zip(hard_predictions, human_rationales, attention_masks_list):
-            # Only consider non-padding tokens
-            valid_positions = mask.bool().cpu().numpy()
-            
-            all_preds.extend(pred[valid_positions].tolist())
-            all_labels.extend(rat[valid_positions].cpu().numpy().tolist())
-        
-        # Compute metrics
+
+        for pred, rat, mask in zip(
+            hard_predictions, human_rationales, attention_masks_list
+        ):
+            valid_positions = mask.bool().cpu().numpy().flatten()
+            all_preds.extend(pred[valid_positions].astype(int).tolist())
+            all_labels.extend(
+                rat.cpu().numpy().flatten()[valid_positions].astype(int).tolist()
+            )
+
+        all_preds = np.array(all_preds, dtype=int)
+        all_labels = np.array(all_labels, dtype=int)
+
         f1 = f1_score(all_labels, all_preds, zero_division=0)
         precision = precision_score(all_labels, all_preds, zero_division=0)
         recall = recall_score(all_labels, all_preds, zero_division=0)
-        
+
         return f1, precision, recall
-    
-    def _compute_faithfulness(
+
+    def _compute_comprehensiveness(
         self,
-        input_ids_list: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor],
+        test_data: List[Dict],
+        test_results: Dict,
         hard_predictions: List[np.ndarray],
-        predicted_classes: List[int],
-        original_probs: List[np.ndarray]
+    ) -> Tuple[float, List[float]]:
+        """
+        Compute comprehensiveness: how much does REMOVING rationales hurt?
+        Uses DataLoader approach for efficiency
+        """
+        # Create modified dataset (remove rationales from attention mask)
+        modified_data = []
+        for item, rationale_mask in zip(test_data, hard_predictions):
+            modified_item = self._create_comprehensiveness_instance(
+                item, rationale_mask
+            )
+            modified_data.append(modified_item)
+
+        # Create DataLoader
+        modified_dataset = self.dataset_class(modified_data)
+        modified_loader = DataLoader(
+            modified_dataset, batch_size=self.batch_size, shuffle=False
+        )
+
+        # Get predictions using model's predict method
+        results = self.model.predict(modified_loader, return_attentions=False)
+        modified_probs = results["probabilities"]
+
+        # Calculate comprehensiveness scores
+        comprehensiveness_scores = []
+        for idx, (prob, label) in enumerate(
+            zip(test_results["probabilities"], test_results["labels"])
+        ):
+            original_prob = prob[
+                label
+            ]  # Probability from normal prediction process for the label
+            modified_prob = modified_probs[idx][label]
+
+            # Comprehensiveness = original - modified (higher is better)
+            comp_score = original_prob - modified_prob
+            comprehensiveness_scores.append(comp_score)
+
+        return modified_probs, comprehensiveness_scores
+
+    def _compute_sufficiency(
+        self,
+        test_data: List[Dict],
+        test_results: Dict,
+        hard_predictions: List[np.ndarray],
     ) -> Tuple[List[float], List[float]]:
         """
-        Compute comprehensiveness and sufficiency scores
-        
-        Comprehensiveness: P(original) - P(text without rationales)
-            - HIGH is good (removing rationales hurt prediction)
-            
-        Sufficiency: P(original) - P(only rationales)
-            - LOW is good (rationales alone are sufficient)
+        Compute sufficiency: how well do ONLY rationales predict?
+        Uses DataLoader approach for efficiency
         """
-        comprehensiveness_scores = []
+        # Create modified dataset (keep only rationales in attention mask)
+        modified_data = []
+        for item, rationale_mask in zip(test_data, hard_predictions):
+            modified_item = self._create_sufficiency_instance(item, rationale_mask)
+            modified_data.append(modified_item)
+
+        # Create DataLoader
+        modified_dataset = self.dataset_class(modified_data)
+        modified_loader = DataLoader(
+            modified_dataset, batch_size=self.batch_size, shuffle=False
+        )
+
+        # Get predictions using model's predict method
+        results = self.model.predict(modified_loader, return_attentions=False)
+        modified_probs = results["probabilities"]
+
+        # Calculate sufficiency scores
         sufficiency_scores = []
-        
-        for input_ids, mask, rationale_mask, pred_class, orig_prob in zip(
-            input_ids_list, attention_masks_list, hard_predictions, 
-            predicted_classes, original_probs
+        for idx, (prob, label) in enumerate(
+            zip(test_results["probabilities"], test_results["labels"])
         ):
-            # Get valid tokens (non-padding)
-            valid_positions = mask.bool().squeeze()
-            valid_input_ids = input_ids.squeeze()[valid_positions]
-            
-            # Get original probability for predicted class
-            orig_class_prob = orig_prob[pred_class]
-            
-            # === COMPREHENSIVENESS: Remove rationales ===
-            # Keep only tokens where rationale_mask is 0
-            rationale_positions = rationale_mask[valid_positions.cpu().numpy()] == 0
-            remaining_ids = valid_input_ids[torch.tensor(rationale_positions)]
-            
-            if len(remaining_ids) > 0:
-                prob_without_rat = self._get_prediction_prob_from_ids(
-                    remaining_ids, pred_class
-                )
-            else:
-                prob_without_rat = 1.0 / len(orig_prob)  # Uniform distribution
-            
-            comprehensiveness = orig_class_prob - prob_without_rat
-            
-            # === SUFFICIENCY: Keep only rationales ===
-            # Keep only tokens where rationale_mask is 1
-            rationale_positions = rationale_mask[valid_positions.cpu().numpy()] == 1
-            rationale_ids = valid_input_ids[torch.tensor(rationale_positions)]
-            
-            if len(rationale_ids) > 0:
-                prob_only_rat = self._get_prediction_prob_from_ids(
-                    rationale_ids, pred_class
-                )
-            else:
-                prob_only_rat = 1.0 / len(orig_prob)  # Uniform distribution
-            
-            sufficiency = orig_class_prob - prob_only_rat
-            
-            comprehensiveness_scores.append(comprehensiveness)
-            sufficiency_scores.append(sufficiency)
-        
-        return comprehensiveness_scores, sufficiency_scores
-    
-    def _get_prediction_prob_from_ids(
-        self, 
-        token_ids: torch.Tensor, 
-        target_class: int,
-        max_length: int = 128
-    ) -> float:
+            original_prob = prob[
+                label
+            ]  # Probability from normal prediction process for the label
+            modified_prob = modified_probs[idx][label]
+
+            # Sufficiency = original - modified (lower/negative is better)
+            suff_score = original_prob - modified_prob
+            sufficiency_scores.append(suff_score)
+
+        return modified_probs, sufficiency_scores
+
+    def _create_comprehensiveness_instance(
+        self, item: Dict, rationale_mask: np.ndarray
+    ) -> Dict:
         """
-        Get model's probability for target class given token IDs
-        
-        Args:
-            token_ids: Tensor of token IDs (no padding, no special tokens except CLS/SEP)
-            target_class: Target class index
-            max_length: Max sequence length
+        Create instance for comprehensiveness: REMOVE rationales from attention
+        Keep: CLS + non-rationale content tokens + SEP
         """
-        self.model.eval()
-        
-        # Handle empty input
-        if len(token_ids) == 0:
-            return 1.0 / self.model.config.num_labels  # Uniform
-        
-        # Ensure we have CLS and SEP tokens
-        cls_token_id = self.tokenizer.cls_token_id
-        sep_token_id = self.tokenizer.sep_token_id
-        
-        # Remove existing CLS/SEP if present
-        token_ids = token_ids[(token_ids != cls_token_id) & (token_ids != sep_token_id)]
-        
-        # Add CLS at start and SEP at end
-        token_ids = torch.cat([
-            torch.tensor([cls_token_id]),
-            token_ids[:max_length - 2],  # Leave room for CLS and SEP
-            torch.tensor([sep_token_id])
-        ])
-        
-        # Create attention mask
-        attention_mask = torch.ones_like(token_ids)
-        
-        # Pad to max_length
-        padding_length = max_length - len(token_ids)
-        if padding_length > 0:
-            token_ids = torch.cat([
-                token_ids,
-                torch.zeros(padding_length, dtype=torch.long)
-            ])
-            attention_mask = torch.cat([
-                attention_mask,
-                torch.zeros(padding_length, dtype=torch.long)
-            ])
-        
-        # Add batch dimension and move to device
-        token_ids = token_ids.unsqueeze(0).to(self.device)
-        attention_mask = attention_mask.unsqueeze(0).to(self.device)
-        
-        # Get prediction
-        with torch.no_grad():
-            outputs = self.model(input_ids=token_ids, attention_mask=attention_mask)
-            probs = torch.softmax(outputs.logits, dim=-1)
-            class_prob = probs[0, target_class].item()
-        
-        return class_prob
+        input_ids = item["input_ids"].cpu().numpy().flatten()
+        orig_mask = item["attention_mask"].cpu().numpy().flatten()
 
+        # Start with original mask
+        new_mask = orig_mask.copy()
 
-# ============================================
-# USAGE EXAMPLE WITH YOUR DATA FORMAT
-# ============================================
+        # Zero out rationale positions (except CLS and SEP)
+        for i in range(len(new_mask)):
+            if rationale_mask[i] == 1:  # This is a rationale
+                # Don't mask if it's CLS or SEP
+                if input_ids[i] not in self.special_token_ids:
+                    new_mask[i] = 0
 
-# def example_usage_with_real_data():
-#     """
-#     Example of how to use the metrics with your actual data format
-#     """
-#     # Your test data format
-#     test_data = [
-#         {
-#             'input_ids': torch.tensor([[101, 5310, 2273, ..., 102]]),
-#             'attention_mask': torch.tensor([[1, 1, 1, ..., 0]]),
-#             'rationales': torch.tensor([[0., 0., 0., ..., 0.]]),
-#             'hard_label': 0,
-#             'soft_label': 0.0,
-#         },
-#         # ... more instances
-#     ]
-    
-#     # Your model predictions
-#     attention_scores = [
-#         np.array([0.1, 0.2, 0.8, ...]),  # Attention for instance 1
-#         # ... more
-#     ]
-    
-#     predicted_classes = [0, 1, 0, ...]  # Your model's predictions
-    
-#     original_probs = [
-#         np.array([0.9, 0.1]),  # Probs for instance 1
-#         # ... more
-#     ]
-    
-#     # Initialize metrics
-#     metrics_calculator = HateInterpreter(model, tokenizer, device)
-    
-#     # Prepare lists
-#     input_ids_list = [d['input_ids'] for d in test_data]
-#     attention_masks_list = [d['attention_mask'] for d in test_data]
-#     human_rationales = [d['rationales'] for d in test_data]
-    
-#     # Compute all metrics
-#     results = metrics_calculator.compute_all_metrics(
-#         input_ids_list=input_ids_list,
-#         attention_masks_list=attention_masks_list,
-#         attention_scores=attention_scores,
-#         human_rationales=human_rationales,
-#         predicted_classes=predicted_classes,
-#         original_probs=original_probs
-#     )
-    
-#     # Print results
-#     print("=== PLAUSIBILITY (Alignment with Human Rationales) ===")
-#     print(f"AUPRC (soft):       {results['auprc']:.4f}")
-#     print(f"Token F1 (hard):    {results['token_f1']:.4f}")
-#     print(f"Token Precision:    {results['token_precision']:.4f}")
-#     print(f"Token Recall:       {results['token_recall']:.4f}")
-#     print()
-#     print("=== FAITHFULNESS (Model Actually Used Rationales) ===")
-#     print(f"Comprehensiveness:  {results['comprehensiveness']:.4f}  (higher is better)")
-#     print(f"Sufficiency:        {results['sufficiency']:.4f}  (lower/negative is better)")
-#     print()
-#     print(f"Average rationale length: {results['avg_rationale_length']} tokens")
-    
-#     return results
+        return {
+            "post_id": item["post_id"],
+            "input_ids": torch.tensor(input_ids).unsqueeze(0),
+            "attention_mask": torch.tensor(new_mask).unsqueeze(0),
+            "rationales": item["rationales"],
+            "hard_label": item["hard_label"],
+        }
+
+    def _create_sufficiency_instance(
+        self, item: Dict, rationale_mask: np.ndarray
+    ) -> Dict:
+        """
+        Create instance for sufficiency: Keep ONLY rationales in attention
+        Keep: CLS + rationale tokens + SEP
+        """
+        input_ids = item["input_ids"].cpu().numpy().flatten()
+        orig_mask = item["attention_mask"].cpu().numpy().flatten()
+
+        # Start with zeros
+        new_mask = np.zeros_like(orig_mask)
+
+        # Always keep CLS and SEP
+        for i in range(len(new_mask)):
+            if input_ids[i] in self.special_token_ids:
+                new_mask[i] = 1
+
+        # Keep rationale positions
+        for i in range(len(new_mask)):
+            if rationale_mask[i] == 1 and orig_mask[i] == 1:
+                new_mask[i] = 1
+
+        return {
+            "post_id": item["post_id"],
+            "input_ids": torch.tensor(input_ids).unsqueeze(0),
+            "attention_mask": torch.tensor(new_mask).unsqueeze(0),
+            "rationales": item["rationales"],
+            "hard_label": item["hard_label"],
+        }
