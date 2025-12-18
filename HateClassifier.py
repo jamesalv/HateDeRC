@@ -428,10 +428,10 @@ class HateClassifier:
                 print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
 
             # Save checkpoint every epoch
-            self.save_model(f"checkpoint_epoch_{epoch + 1}")
+            # self.save_model(f"checkpoint_epoch_{epoch + 1}")
 
         # Save final model and training history
-        self.save_model("final_model")
+        # self.save_model("final_model")
         self.save_history()
 
         print("\n" + "=" * 60)
