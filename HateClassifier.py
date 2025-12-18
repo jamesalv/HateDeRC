@@ -121,11 +121,12 @@ class HateClassifier:
         # Configure loss function
         if config.class_weighting:
             class_weight = kwargs.get("class_weight")
-            if class_weight:
+            print("Using class weighting for loss function.")
+            if class_weight is not None:
                 class_weight = class_weight.to(self.device)
                 self.cls_criterion = CrossEntropyLoss(weight=class_weight)
-            else:
-                raise Exception("class_weight not found!")
+            # else:
+            #     raise Exception("class_weight not found!")
         else:
             self.cls_criterion = CrossEntropyLoss()
 

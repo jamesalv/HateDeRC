@@ -40,3 +40,5 @@ Thumbs.db
 # Keep documentation now that we have proper experiment tracking
 !EXPERIMENT_MANAGEMENT.md
 !README.md
+
+experiments/
