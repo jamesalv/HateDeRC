@@ -18,6 +18,48 @@ from pathlib import Path
 
 
 class HateClassifier:
+    """
+    HateDeRC: Hate Speech Detection with Debiasing Residual Connections.
+    
+    This classifier implements a novel architecture for binary hate speech detection
+    that reduces dependency on target-sensitive words (e.g., race, religion, gender).
+    
+    Key Components:
+    ---------------
+    1. **DeRC Mechanism (Debiasing Residual Connection)**:
+       - Creates a residual connection from lower layer (layer 3) to final layer
+       - Lower layers capture shallow, bias-prone patterns (target words)
+       - Final layer learns bias-independent features by incorporating debiased residuals
+       - Prevents over-reliance on lexical shortcuts
+    
+    2. **Multi-Layer Loss**:
+       - Auxiliary loss from debias layer (layer 3): guides early layers to learn useful representations
+       - Main loss from final layer: ensures correct final predictions
+       - Configurable weighting allows balancing between auxiliary and main objectives
+    
+    3. **Ranking-Based Attention Supervision**:
+       - Uses human token-level annotations as supervision signal
+       - Employs pairwise ranking loss instead of cross-entropy (respects independent annotations)
+       - Enforces: tokens with higher human importance should receive higher attention
+       - Helps model focus on contextually relevant hate indicators
+    
+    Loss Function:
+    --------------
+    Total Loss = α × lower_layer_loss + β × upper_layer_loss + λ × attention_ranking_loss
+    
+    Where:
+    - α (lower_loss_weight): Weight for auxiliary classification loss
+    - β (upper_loss_weight): Weight for main classification loss  
+    - λ (lambda_attn): Weight for attention supervision loss
+    
+    Architecture:
+    -------------
+    Input → BERT-like Encoder (all hidden states) → Multi-layer Classifiers
+                                ↓
+                          Layer 3 (debias) -----(residual)----→ Final Layer
+                                ↓                                    ↓
+                         Auxiliary Loss                        Main Loss
+    """
     def __init__(self, config: TrainingConfig, **kwargs):
         self.config = config
 
@@ -51,9 +93,13 @@ class HateClassifier:
         self.debias_layer = 3  # Layer index for auxiliary loss
         self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
 
+        # Loss Weighting Configuration
+        self.lower_loss_weight = getattr(config, "lower_loss_weight", 0.5)  # α: auxiliary loss weight
+        self.upper_loss_weight = getattr(config, "upper_loss_weight", 0.5)  # β: main loss weight
+        self.lambda_attn = getattr(config, "lambda_attn", 0.1)              # λ: attention loss weight
+
         # Attention Training Configuration
         self.train_attention = getattr(config, "train_attention", False)
-        self.lambda_attn = getattr(config, "lambda_attn", 0.1)
         self.ranking_margin = getattr(
             config, "ranking_margin", 0.1
         )  # Margin for pairwise ranking
@@ -110,10 +156,17 @@ class HateClassifier:
         }
 
     def train_epoch(self, train_dataloader):
+        """
+        Train for one epoch using the HateDeRC architecture.
+        
+        Returns:
+            float: Average total loss for the epoch
+        """
         self.base_model.train()
         for classifier in self.classifier_list:
             classifier.train()
 
+        # Track individual loss components for monitoring
         total_loss = 0
         total_cls_loss = 0
         total_lower_loss = 0
@@ -160,43 +213,24 @@ class HateClassifier:
                         logits = self.classifier_list[i](self.dropout(pooled_output))
                     logits_list.append(logits)
 
-                # Main logits from final layer
-                final_logits = logits_list[-1]
-
-                if self.use_multi_layer_loss:
-                    # Multi-layer loss (similar to BertDistill)
-                    # Lower layer loss (auxiliary)
-                    lower_loss = self.cls_criterion(
-                        logits_list[self.debias_layer], labels
-                    )
-
-                    # Upper layer loss (final)
-                    upper_loss = self.cls_criterion(logits_list[-1], labels)
-
-                    # Combined loss
-                    loss = 0.5 * lower_loss + 0.5 * upper_loss
-
-                    total_lower_loss += lower_loss.item()
-                    total_cls_loss += upper_loss.item()
-                else:
-                    # Single loss from final layer only
-                    loss = self.cls_criterion(final_logits, labels)
-                    total_cls_loss += loss.item()
-
-                if self.train_attention:
-                    attentions = outputs.attentions  # Tuple of attention tensors
-                    if attentions is not None and len(attentions) > 0:
-                        model_attention = self.extract_attention(
-                            attentions, return_tensor=True
-                        )
-                        human_rationales = batch["rationales"].to(
-                            self.device, non_blocking=True
-                        )
-                        attn_loss = self.calculate_attention_loss(
-                            human_rationales, model_attention, attention_mask
-                        )
-                        loss = loss + attn_loss
-                        total_attn_loss += attn_loss.item()
+                # Calculate unified loss with all components
+                loss_dict = self._calculate_loss(
+                    logits_list=logits_list,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    attentions=outputs.attentions if self.train_attention else None,
+                    human_rationales=batch.get("rationales") if self.train_attention else None,
+                )
+                
+                loss = loss_dict["total_loss"]
+                
+                # Track individual loss components
+                if "cls_loss" in loss_dict:
+                    total_cls_loss += loss_dict["cls_loss"]
+                if "lower_loss" in loss_dict:
+                    total_lower_loss += loss_dict["lower_loss"]
+                if "attn_loss" in loss_dict:
+                    total_attn_loss += loss_dict["attn_loss"]
 
                 # Scale loss for gradient accumulation
                 loss = loss / self.gradient_accumulation_steps
@@ -237,33 +271,19 @@ class HateClassifier:
                 if self.scheduler:
                     self.scheduler.step()
 
-            if self.use_multi_layer_loss and self.train_attention:
-                progress_bar.set_postfix(
-                    {
-                        "total_loss": total_loss / num_batches,
-                        "upper_loss": total_cls_loss / num_batches,
-                        "lower_loss": total_lower_loss / num_batches,
-                        "attn_loss": total_attn_loss / num_batches,
-                    }
-                )
+            # Update progress bar with relevant loss components
+            postfix = {"total": total_loss / num_batches}
+            
             if self.use_multi_layer_loss:
-                progress_bar.set_postfix(
-                    {
-                        "total_loss": total_loss / num_batches,
-                        "upper_loss": total_cls_loss / num_batches,
-                        "lower_loss": total_lower_loss / num_batches,
-                    }
-                )
-            elif self.train_attention:
-                progress_bar.set_postfix(
-                    {
-                        "total_loss": total_loss / num_batches,
-                        "cls_loss": total_cls_loss / num_batches,
-                        "attn_loss": total_attn_loss / num_batches,
-                    }
-                )
+                postfix["main"] = total_cls_loss / num_batches
+                postfix["aux"] = total_lower_loss / num_batches
             else:
-                progress_bar.set_postfix({"loss": total_loss / num_batches})
+                postfix["cls"] = total_cls_loss / num_batches
+                
+            if self.train_attention and total_attn_loss > 0:
+                postfix["attn"] = total_attn_loss / num_batches
+            
+            progress_bar.set_postfix(postfix)
 
         return total_loss / num_batches
 
@@ -319,7 +339,26 @@ class HateClassifier:
         return avg_loss, accuracy, f1
 
     def train(self, train_dataloader, val_dataloader):
-        """Train the model and track metrics history."""
+        """
+        Train the HateDeRC model with multi-component loss.
+        
+        Training Configuration:
+        - DeRC: Residual connection from layer 3 to final layer
+        - Multi-layer loss: Auxiliary (layer 3) + Main (final layer)
+        - Attention supervision: Ranking-based loss from human annotations
+        
+        Loss Weights:
+        - Lower loss: {:.2f}
+        - Upper loss: {:.2f}  
+        - Attention: {:.2f}
+        
+        Args:
+            train_dataloader: DataLoader for training data
+            val_dataloader: DataLoader for validation data
+            
+        Returns:
+            dict: Training history with loss and metrics per epoch
+        """.format(self.lower_loss_weight, self.upper_loss_weight, self.lambda_attn)
         print(f"Training on device: {self.device}")
         print(f"Model: {self.config.model_name}")
         print(f"Epochs: {self.config.num_epochs}")
@@ -331,6 +370,15 @@ class HateClassifier:
         print(f"Learning rate: {self.config.learning_rate}")
         print(f"Mixed precision (AMP): {self.use_amp}")
         print(f"Gradient clipping: {self.max_grad_norm}")
+        print(f"\nLoss Configuration:")
+        print(f"  Multi-layer loss: {self.use_multi_layer_loss}")
+        if self.use_multi_layer_loss:
+            print(f"    - Auxiliary (layer {self.debias_layer}): α={self.lower_loss_weight}")
+            print(f"    - Main (final layer): β={self.upper_loss_weight}")
+        print(f"  Attention supervision: {self.train_attention}")
+        if self.train_attention:
+            print(f"    - Ranking loss: λ={self.lambda_attn}")
+            print(f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}")
         print("=" * 60)
 
         best_f1 = 0.0
@@ -609,6 +657,75 @@ class HateClassifier:
             )
         else:
             return avg_cls_attention.cpu().numpy()  # Convert to numpy for inference
+
+    def _calculate_loss(self, logits_list, labels, attention_mask, attentions=None, human_rationales=None):
+        """
+        Calculate unified loss with configurable component weights.
+        
+        This method computes the total loss as a weighted combination of:
+        1. Classification loss (auxiliary from debias layer if multi-layer enabled)
+        2. Main classification loss (from final layer)
+        3. Attention ranking loss (if attention supervision enabled)
+        
+        Args:
+            logits_list: List of logits from all classifier heads
+            labels: Ground truth labels (batch_size,)
+            attention_mask: Attention mask for padding (batch_size, seq_len)
+            attentions: Tuple of attention tensors from model (optional)
+            human_rationales: Human token annotations (batch_size, seq_len) (optional)
+        
+        Returns:
+            dict: Dictionary containing:
+                - 'total_loss': Weighted sum of all loss components
+                - 'cls_loss': Main classification loss (if applicable)
+                - 'lower_loss': Auxiliary classification loss (if multi-layer enabled)
+                - 'attn_loss': Attention ranking loss (if attention training enabled)
+        """
+        loss_dict = {}
+        
+        # Main logits from final layer
+        final_logits = logits_list[-1]
+        
+        # Component 1 & 2: Classification Losses
+        if self.use_multi_layer_loss:
+            # Auxiliary loss from debias layer (helps guide lower layer representations)
+            lower_loss = self.cls_criterion(logits_list[self.debias_layer], labels)
+            
+            # Main loss from final layer (with residual connection)
+            upper_loss = self.cls_criterion(final_logits, labels)
+            
+            # Weighted combination: Total = α × lower + β × upper
+            cls_loss = (self.lower_loss_weight * lower_loss + 
+                       self.upper_loss_weight * upper_loss)
+            
+            loss_dict["lower_loss"] = lower_loss.item()
+            loss_dict["cls_loss"] = upper_loss.item()
+        else:
+            # Single loss from final layer only (baseline)
+            cls_loss = self.cls_criterion(final_logits, labels)
+            loss_dict["cls_loss"] = cls_loss.item()
+        
+        total_loss = cls_loss
+        
+        # Component 3: Attention Ranking Loss
+        if self.train_attention and attentions is not None and human_rationales is not None:
+            if len(attentions) > 0:
+                # Extract model attention from last layer
+                model_attention = self.extract_attention(attentions, return_tensor=True)
+                
+                # Move rationales to device
+                human_rationales = human_rationales.to(self.device, non_blocking=True)
+                
+                # Calculate ranking loss (already weighted by lambda_attn internally)
+                attn_loss = self.calculate_attention_loss(
+                    human_rationales, model_attention, attention_mask
+                )
+                
+                total_loss = total_loss + attn_loss
+                loss_dict["attn_loss"] = attn_loss.item()
+        
+        loss_dict["total_loss"] = total_loss
+        return loss_dict
 
     def calculate_attention_loss(
         self, human_rationales, models_attentions, attention_mask
