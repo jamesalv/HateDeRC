@@ -51,6 +51,16 @@ class HateClassifier:
         self.debias_layer = 3  # Layer index for auxiliary loss
         self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
 
+        # Attention Training Configuration
+        self.train_attention = getattr(config, "train_attention", False)
+        self.lambda_attn = getattr(config, "lambda_attn", 0.1)
+        self.ranking_margin = getattr(
+            config, "ranking_margin", 0.1
+        )  # Margin for pairwise ranking
+        self.ranking_threshold = getattr(
+            config, "ranking_threshold", 0.05
+        )  # Threshold for significant pairs
+
         # Move models to device
         self.base_model.to(self.device)
         self.classifier_list.to(self.device)
@@ -107,6 +117,7 @@ class HateClassifier:
         total_loss = 0
         total_cls_loss = 0
         total_lower_loss = 0
+        total_attn_loss = 0
         num_batches = 0
 
         progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
@@ -122,6 +133,7 @@ class HateClassifier:
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
+                    output_attentions=self.train_attention,
                 )
 
                 # Get hidden states from all layers
@@ -171,6 +183,21 @@ class HateClassifier:
                     loss = self.cls_criterion(final_logits, labels)
                     total_cls_loss += loss.item()
 
+                if self.train_attention:
+                    attentions = outputs.attentions  # Tuple of attention tensors
+                    if attentions is not None and len(attentions) > 0:
+                        model_attention = self.extract_attention(
+                            attentions, return_tensor=True
+                        )
+                        human_rationales = batch["rationales"].to(
+                            self.device, non_blocking=True
+                        )
+                        attn_loss = self.calculate_attention_loss(
+                            human_rationales, model_attention, attention_mask
+                        )
+                        loss = loss + attn_loss
+                        total_attn_loss += attn_loss.item()
+
                 # Scale loss for gradient accumulation
                 loss = loss / self.gradient_accumulation_steps
 
@@ -210,12 +237,29 @@ class HateClassifier:
                 if self.scheduler:
                     self.scheduler.step()
 
+            if self.use_multi_layer_loss and self.train_attention:
+                progress_bar.set_postfix(
+                    {
+                        "total_loss": total_loss / num_batches,
+                        "upper_loss": total_cls_loss / num_batches,
+                        "lower_loss": total_lower_loss / num_batches,
+                        "attn_loss": total_attn_loss / num_batches,
+                    }
+                )
             if self.use_multi_layer_loss:
                 progress_bar.set_postfix(
                     {
                         "total_loss": total_loss / num_batches,
                         "upper_loss": total_cls_loss / num_batches,
                         "lower_loss": total_lower_loss / num_batches,
+                    }
+                )
+            elif self.train_attention:
+                progress_bar.set_postfix(
+                    {
+                        "total_loss": total_loss / num_batches,
+                        "cls_loss": total_cls_loss / num_batches,
+                        "attn_loss": total_attn_loss / num_batches,
                     }
                 )
             else:
@@ -488,7 +532,7 @@ class HateClassifier:
         print("=" * 60)
 
         results = {
-            'post_ids': all_post_ids,
+            "post_ids": all_post_ids,
             "predictions": all_preds,
             "labels": all_labels,
             "probabilities": all_probs,
@@ -534,7 +578,17 @@ class HateClassifier:
 
         print(f"Test results saved to: {results_path}")
 
-    def extract_attention(self, attentions) -> np.ndarray | None:
+    def extract_attention(self, attentions, return_tensor=False):
+        """
+        Extract CLS token attention from last layer, averaged across all heads.
+
+        Args:
+            attentions: Tuple of attention tensors from model
+            return_tensor: If True, returns tensor (for training). If False, returns numpy (for inference)
+
+        Returns:
+            (batch_size, seq_len) attention weights as tensor or numpy array
+        """
         if attentions is None or len(attentions) == 0:
             print("WARNING: No attention data available.")
             return None
@@ -548,4 +602,92 @@ class HateClassifier:
         ]  # Shape: (batch_size, num_heads, seq_len)
         # Average over all heads
         avg_cls_attention = cls_attentions.mean(dim=1)  # Shape: (batch_size, seq_len)
-        return avg_cls_attention.cpu().numpy()
+
+        if return_tensor:
+            return (
+                avg_cls_attention  # Keep as tensor for training (preserves gradients)
+            )
+        else:
+            return avg_cls_attention.cpu().numpy()  # Convert to numpy for inference
+
+    def calculate_attention_loss(
+        self, human_rationales, models_attentions, attention_mask
+    ):
+        """
+        Calculate pairwise margin ranking loss for attention supervision.
+
+        For each pair of tokens (i, j) where human_score[i] > human_score[j],
+        we enforce: attention[i] - attention[j] >= margin
+
+        This respects the independent nature of human annotations and focuses on
+        relative importance rather than absolute values.
+
+        Args:
+            human_rationales: (batch_size, seq_len) - Independent token importance scores [0-1]
+            models_attentions: (batch_size, seq_len) - Model attention weights (softmax tensor)
+            attention_mask: (batch_size, seq_len) - Mask for padding tokens
+
+        Returns:
+            Scalar ranking loss
+        """
+        # Ensure models_attentions is a tensor (should be from extract_attention with return_tensor=True)
+        if isinstance(models_attentions, np.ndarray):
+            models_attentions = torch.from_numpy(models_attentions).to(self.device)
+
+        batch_size, seq_len = human_rationales.shape
+
+        # Mask out padding positions
+        human_rationales = human_rationales * attention_mask
+        models_attentions = models_attentions * attention_mask
+
+        total_loss = 0.0
+        total_pairs = 0
+
+        for b in range(batch_size):
+            # Get valid (non-padding) positions for this sample
+            valid_mask = attention_mask[b].bool()
+            valid_indices = torch.where(valid_mask)[0]
+
+            if len(valid_indices) < 2:
+                continue  # Skip if less than 2 valid tokens
+
+            # Get human scores and model attentions for valid tokens
+            human_scores = human_rationales[b, valid_indices]  # (num_valid,)
+            model_attn = models_attentions[b, valid_indices]  # (num_valid,)
+
+            # Create all pairs: (num_valid, num_valid)
+            # human_i: (num_valid, 1), human_j: (1, num_valid)
+            human_i = human_scores.unsqueeze(1)  # (num_valid, 1)
+            human_j = human_scores.unsqueeze(0)  # (1, num_valid)
+
+            model_i = model_attn.unsqueeze(1)  # (num_valid, 1)
+            model_j = model_attn.unsqueeze(0)  # (1, num_valid)
+
+            # Find pairs where human_i > human_j (should have model_i > model_j)
+            human_diff = human_i - human_j  # (num_valid, num_valid)
+            model_diff = model_i - model_j  # (num_valid, num_valid)
+
+            # Only consider pairs where there's a clear difference in human scores
+            # (avoid pairs with very similar scores)
+            significant_pairs = (
+                human_diff > self.ranking_threshold
+            ).float()  # Threshold to avoid noise
+
+            # Margin ranking loss: max(0, margin - (model_i - model_j)) when human_i > human_j
+            # We want: model_i - model_j >= margin when human_i > human_j
+            ranking_loss = torch.relu(self.ranking_margin - model_diff)
+
+            # Apply mask to only consider significant pairs
+            ranking_loss = ranking_loss * significant_pairs
+
+            # Accumulate
+            num_pairs = significant_pairs.sum()
+            if num_pairs > 0:
+                total_loss += ranking_loss.sum() / num_pairs
+                total_pairs += 1
+
+        if total_pairs == 0:
+            return torch.tensor(0.0, device=human_rationales.device)
+
+        avg_loss = total_loss / total_pairs
+        return self.lambda_attn * avg_loss
