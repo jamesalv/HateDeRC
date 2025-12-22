@@ -12,6 +12,20 @@ from sklearn.metrics import (
 )
 from preprocessing import find_ranges
 
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from typing import List, Dict, Tuple
+import json
+from sklearn.metrics import (
+    precision_recall_curve,
+    auc,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+
+
 class HateInterpreter:
     """
     Compute faithfulness metrics using the model's existing predict() method.
@@ -57,65 +71,42 @@ class HateInterpreter:
         attention_scores = [item for item in test_results["attentions"]]
 
         # 1. Extract top-k as hard predictions
+        print("[1/5] Extracting top-k tokens for hard rationale predictions...")
         hard_predictions = self._extract_top_k_tokens(
             attention_scores, attention_masks_list, input_ids_list, k
         )
 
-        hard_rationale_predictions, soft_rationale_predictions = (
-            self._convert_attention_to_evidence_format(
-                input_ids_list, attention_scores, hard_predictions
-            )
-        )
+        hard_rationale_predictions, soft_rationale_predictions = self._convert_attention_to_evidence_format(input_ids_list, attention_scores, hard_predictions)
 
-        # 2. PLAUSIBILITY METRICS
-        print("\n[1/3] Computing plausibility metrics...")
-        auprc = self._compute_auprc(
-            attention_scores, human_rationales, attention_masks_list, input_ids_list
-        )
-        token_f1, token_prec, token_rec = self._compute_token_f1(
-            hard_predictions, human_rationales, attention_masks_list
-        )
-
-        # 3. FAITHFULNESS METRICS
-        print("[2/3] Computing comprehensiveness scores...")
+        # 1. FAITHFULNESS METRICS
+        print("[2/5] Computing comprehensiveness scores...")
         raw_comprehensiveness, comprehensiveness_scores = (
             self._compute_comprehensiveness(test_data, test_results, hard_predictions)
         )
 
-        print("[3/3] Computing sufficiency scores...")
+        print("[3/5] Computing sufficiency scores...")
         raw_sufficiency, sufficiency_scores = self._compute_sufficiency(
             test_data, test_results, hard_predictions
         )
 
         # 4. Convert to eraser format
-        results_eraser = self._convert_result_to_eraser_format(
-            test_results,
-            hard_rationale_predictions,
-            soft_rationale_predictions,
-            raw_sufficiency,
-            raw_comprehensiveness,
-        )
+        print("[4/5] Converting results to ERASER format and saving...")
+        results_eraser = self._convert_result_to_eraser_format(test_results, hard_rationale_predictions, soft_rationale_predictions, raw_sufficiency, raw_comprehensiveness)
         # Convert to JSONL format
-        jsonl_output = "\n".join([json.dumps(entry) for entry in results_eraser])
-        with open(eraser_save_path, "w") as f:
+        jsonl_output = '\n'.join([json.dumps(entry) for entry in results_eraser])
+        with open(eraser_save_path, 'w') as f:
             f.write(jsonl_output)
-
+        
+        # 5. Calculate ERASER metrics
+        print("[5/5] Calculating ERASER metrics...")
+        
         return {
-            # Plausibility
-            "auprc": auprc,
-            "token_f1": token_f1,
-            "token_precision": token_prec,
-            "token_recall": token_rec,
-            # Faithfulness
-            "comprehensiveness": float(np.mean(comprehensiveness_scores)),
-            "sufficiency": float(np.mean(sufficiency_scores)),
-            # Additional
-            "avg_rationale_length": k,
+            'comprehensiveness': float(np.average(comprehensiveness_scores)),
+            'sufficiency': float(np.average(sufficiency_scores)),
+            
         }
 
-    def _convert_attention_to_evidence_format(
-        self, input_ids_list, attention_scores, hard_predictions
-    ):
+    def _convert_attention_to_evidence_format(self, input_ids_list, attention_scores, hard_predictions):
         # 2. Collect evidence
         hard_rationale_predictions = []
         for idx, hp in enumerate(hard_predictions):
@@ -127,12 +118,10 @@ class HateInterpreter:
                 else:
                     start, end = span[0], span[1] + 1
 
-                evidences.append(
-                    {
-                        "start_token": start,
-                        "end_token": end,
-                    }
-                )
+                evidences.append({
+                    "start_token": start,
+                    "end_token": end,
+                })
             hard_rationale_predictions.append(evidences)
 
         soft_rationale_predictions = []
@@ -153,54 +142,31 @@ class HateInterpreter:
         all_entries = []
         for idx, data in enumerate(test_result["post_id"]):
             entry = {
-                "annotation_id": data,
-                "classification": str(int(test_result["predictions"][idx])),
-                "classification_scores": {
-                    0: float(test_result["probabilities"][idx][0]),
-                    1: float(test_result["probabilities"][idx][1]),
-                },
-                "rationales": [
-                    {
-                        "docid": data,
-                        "hard_rationale_predictions": hard_rationale_predictions[idx],
-                        "soft_rationale_predictions": [
-                            float(x) for x in soft_rationale_predictions[idx]
-                        ],
-                    }
-                ],
-                "sufficiency_classification_scores": {
-                    0: float(sufficiency_scores[idx][0]),
-                    1: float(sufficiency_scores[idx][1]),
-                },
-                "comprehensiveness_classification_scores": {
-                    0: float(comprehensiveness_scores[idx][0]),
-                    1: float(comprehensiveness_scores[idx][1]),
-                },
+            'annotation_id': data,
+            'classification': str(int(test_result["predictions"][idx])),
+            'classification_scores': {
+                0: float(test_result["probabilities"][idx][0]),
+                1: float(test_result["probabilities"][idx][1]),
+            },
+            'rationales': [
+                {
+                    "docid": data,
+                    "hard_rationale_predictions": hard_rationale_predictions[idx],
+                    "soft_rationale_predictions": [float(x) for x in soft_rationale_predictions[idx]],
+                }
+            ],
+            'sufficiency_classification_scores': {
+                0: float(sufficiency_scores[idx][0]),
+                1: float(sufficiency_scores[idx][1])
+            },
+            'comprehensiveness_classification_scores': {
+                0: float(comprehensiveness_scores[idx][0]),
+                1: float(comprehensiveness_scores[idx][1])
+            }
             }
             all_entries.append(entry)
 
         return all_entries
-
-    def _calculate_average_rationale_length(
-        self,
-        human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor],
-        input_ids_list: List[torch.Tensor],
-    ) -> int:
-        """Calculate average number of content rationale tokens"""
-        lengths = []
-        for idx, (rat, mask) in enumerate(zip(human_rationales, attention_masks_list)):
-            valid_positions = mask.bool().cpu().numpy().flatten()
-
-            # Exclude special tokens
-            input_ids = input_ids_list[idx].cpu().numpy().flatten()
-            is_special = np.isin(input_ids, list(self.special_token_ids))
-            content_positions = valid_positions & ~is_special
-
-            rat_count = (rat.cpu().numpy().flatten()[content_positions] == 1).sum()
-            lengths.append(rat_count)
-
-        return max(1, int(np.mean(lengths)))
 
     def _extract_top_k_tokens(
         self,
@@ -233,71 +199,7 @@ class HateInterpreter:
             hard_predictions.append(pred_mask)
 
         return hard_predictions
-
-    def _compute_auprc(
-        self,
-        attention_scores: List[np.ndarray],
-        human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor],
-        input_ids_list: List[torch.Tensor],
-    ) -> float:
-        """Compute AUPRC for soft attention scores"""
-        all_scores = []
-        all_labels = []
-
-        for idx, (attn, rat, mask) in enumerate(
-            zip(attention_scores, human_rationales, attention_masks_list)
-        ):
-            valid_positions = mask.bool().cpu().numpy().flatten()
-
-            # Exclude special tokens
-            input_ids = input_ids_list[idx].cpu().numpy().flatten()
-            is_special = np.isin(input_ids, list(self.special_token_ids))
-            content_positions = valid_positions & ~is_special
-
-            all_scores.extend(attn[content_positions].tolist())
-            all_labels.extend(
-                rat.cpu().numpy().flatten()[content_positions].astype(int).tolist()
-            )
-
-        all_scores = np.array(all_scores, dtype=float)
-        all_labels = np.array(all_labels, dtype=int)
-
-        if len(np.unique(all_labels)) < 2:
-            print(f"Warning: Only one class in labels: {np.unique(all_labels)}")
-            return 0.0
-
-        precision, recall, _ = precision_recall_curve(all_labels, all_scores)
-        return auc(recall, precision)
-
-    def _compute_token_f1(
-        self,
-        hard_predictions: List[np.ndarray],
-        human_rationales: List[torch.Tensor],
-        attention_masks_list: List[torch.Tensor],
-    ) -> Tuple[float, float, float]:
-        """Compute token-level F1, Precision, Recall"""
-        all_preds = []
-        all_labels = []
-
-        for pred, rat, mask in zip(
-            hard_predictions, human_rationales, attention_masks_list
-        ):
-            valid_positions = mask.bool().cpu().numpy().flatten()
-            all_preds.extend(pred[valid_positions].astype(int).tolist())
-            all_labels.extend(
-                rat.cpu().numpy().flatten()[valid_positions].astype(int).tolist()
-            )
-
-        all_preds = np.array(all_preds, dtype=int)
-        all_labels = np.array(all_labels, dtype=int)
-
-        f1 = f1_score(all_labels, all_preds, zero_division=0)
-        precision = precision_score(all_labels, all_preds, zero_division=0)
-        recall = recall_score(all_labels, all_preds, zero_division=0)
-
-        return f1, precision, recall
-
+    
     def _compute_comprehensiveness(
         self,
         test_data: List[Dict],
@@ -328,9 +230,7 @@ class HateInterpreter:
 
         # Calculate comprehensiveness scores
         comprehensiveness_scores = []
-        for idx, (prob, label) in enumerate(
-            zip(test_results["probabilities"], test_results["labels"])
-        ):
+        for idx, (prob, label) in enumerate(zip(test_results["probabilities"], test_results['predictions'])):
             original_prob = prob[
                 label
             ]  # Probability from normal prediction process for the label
@@ -370,9 +270,7 @@ class HateInterpreter:
 
         # Calculate sufficiency scores
         sufficiency_scores = []
-        for idx, (prob, label) in enumerate(
-            zip(test_results["probabilities"], test_results["labels"])
-        ):
+        for idx, (prob, label) in enumerate(zip(test_results["probabilities"], test_results['predictions'])):
             original_prob = prob[
                 label
             ]  # Probability from normal prediction process for the label
@@ -440,5 +338,5 @@ class HateInterpreter:
             "input_ids": torch.tensor(input_ids).unsqueeze(0),
             "attention_mask": torch.tensor(new_mask).unsqueeze(0),
             "rationales": item["rationales"],
-            "hard_label": item["hard_label"],
+            "hard_label": item["hard_label"]
         }
