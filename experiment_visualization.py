@@ -303,10 +303,10 @@ def plot_xai_metrics(
         data.append(
             {
                 "Experiment": name,
-                "AUPRC": xai_metrics.get("auprc", 0),
-                "Token F1": xai_metrics.get("token_f1", 0),
-                "Comprehensiveness": xai_metrics.get("comprehensiveness", 0),
-                "Sufficiency": xai_metrics.get("sufficiency", 0),
+                "AUPRC": xai_metrics.get("token_soft_metrics", 0).get('auprc', 0),
+                "Token F1": xai_metrics.get("token_prf", 0).get("instance_macro", 0).get("f1", 0),
+                "Comprehensiveness": xai_metrics.get("classification_scores", 0).get("comprehensiveness", 0),
+                "Sufficiency": xai_metrics.get("classification_scores", 0).get("sufficiency", 0),
             }
         )
 
