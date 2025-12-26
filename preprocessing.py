@@ -3,6 +3,7 @@ import string
 import numpy as np
 import torch
 
+
 def deobfuscate_text(text):
     """
     Normalize common text obfuscation patterns to reveal original words.
@@ -23,27 +24,25 @@ def deobfuscate_text(text):
     # 1. Handle asterisk/symbol replacements
     symbol_patterns = {
         # Common profanity
-        r'f\*+c?k': 'fuck',
-        r'f\*+': 'fuck',
-        r's\*+t': 'shit',
-        r'b\*+ch': 'bitch',
-        r'a\*+s': 'ass',
-        r'd\*+n': 'damn',
-        r'h\*+l': 'hell',
-        r'c\*+p': 'crap',
-
+        r"f\*+c?k": "fuck",
+        r"f\*+": "fuck",
+        r"s\*+t": "shit",
+        r"b\*+ch": "bitch",
+        r"a\*+s": "ass",
+        r"d\*+n": "damn",
+        r"h\*+l": "hell",
+        r"c\*+p": "crap",
         # Slurs and hate speech terms (be comprehensive for detection)
-        r'n\*+g+[aer]+': 'nigger',  # Various n-word obfuscations
-        r'f\*+g+[ot]*': 'faggot',
-        r'r\*+[dt]ard': 'retard',
-        r'sp\*+c': 'spic',
-
+        r"n\*+g+[aer]+": "nigger",  # Various n-word obfuscations
+        r"f\*+g+[ot]*": "faggot",
+        r"r\*+[dt]ard": "retard",
+        r"sp\*+c": "spic",
         # Other symbols
-        r'@ss': 'ass',
-        r'b@tch': 'bitch',
-        r'sh!t': 'shit',
-        r'f#ck': 'fuck',
-        r'd@mn': 'damn',
+        r"@ss": "ass",
+        r"b@tch": "bitch",
+        r"sh!t": "shit",
+        r"f#ck": "fuck",
+        r"d@mn": "damn",
     }
 
     for pattern, replacement in symbol_patterns.items():
@@ -51,12 +50,12 @@ def deobfuscate_text(text):
 
     # 2. Handle character spacing (f u c k -> fuck)
     spacing_patterns = {
-        r'\bf\s+u\s+c\s+k\b': 'fuck',
-        r'\bs\s+h\s+i\s+t\b': 'shit',
-        r'\bd\s+a\s+m\s+n\b': 'damn',
-        r'\bh\s+e\s+l\s+l\b': 'hell',
-        r'\ba\s+s\s+s\b': 'ass',
-        r'\bc\s+r\s+a\s+p\b': 'crap',
+        r"\bf\s+u\s+c\s+k\b": "fuck",
+        r"\bs\s+h\s+i\s+t\b": "shit",
+        r"\bd\s+a\s+m\s+n\b": "damn",
+        r"\bh\s+e\s+l\s+l\b": "hell",
+        r"\ba\s+s\s+s\b": "ass",
+        r"\bc\s+r\s+a\s+p\b": "crap",
     }
 
     for pattern, replacement in spacing_patterns.items():
@@ -65,14 +64,14 @@ def deobfuscate_text(text):
     # 3. Handle number/letter substitutions
     leet_patterns = {
         # Basic leet speak
-        r'\b3\s*1\s*1\s*3\b': 'elle',  # 3113 -> elle
-        r'\bf4g\b': 'fag',
-        r'\bf4gg0t\b': 'faggot',
-        r'\bn00b\b': 'noob',
-        r'\bl33t\b': 'leet',
-        r'\bh4t3\b': 'hate',
-        r'\b5h1t\b': 'shit',
-        r'\bf0ck\b': 'fock',
+        r"\b3\s*1\s*1\s*3\b": "elle",  # 3113 -> elle
+        r"\bf4g\b": "fag",
+        r"\bf4gg0t\b": "faggot",
+        r"\bn00b\b": "noob",
+        r"\bl33t\b": "leet",
+        r"\bh4t3\b": "hate",
+        r"\b5h1t\b": "shit",
+        r"\bf0ck\b": "fock",
     }
 
     for pattern, replacement in leet_patterns.items():
@@ -80,36 +79,37 @@ def deobfuscate_text(text):
 
     # 4. Handle repeated characters and separators
     # Remove excessive punctuation between letters
-    result = re.sub(r'([a-z])[^\w\s]+([a-z])', r'\1\2', result)
+    result = re.sub(r"([a-z])[^\w\s]+([a-z])", r"\1\2", result)
 
     # Handle underscore separation
-    result = re.sub(r'([a-z])_+([a-z])', r'\1\2', result)
+    result = re.sub(r"([a-z])_+([a-z])", r"\1\2", result)
 
     # Handle dot separation
-    result = re.sub(r'([a-z])\.+([a-z])', r'\1\2', result)
+    result = re.sub(r"([a-z])\.+([a-z])", r"\1\2", result)
 
     # 5. Handle common misspellings/variations used for evasion
     evasion_patterns = {
-        r'\bfuk\b': 'fuck',
-        r'\bfuq\b': 'fuck',
-        r'\bfck\b': 'fuck',
-        r'\bshyt\b': 'shit',
-        r'\bshit\b': 'shit',
-        r'\bbiatch\b': 'bitch',
-        r'\bbeatch\b': 'bitch',
-        r'\basshole\b': 'asshole',
-        r'\ba55hole\b': 'asshole',
-        r'\btard\b': 'retard',
-        r'\bfagg\b': 'fag',
+        r"\bfuk\b": "fuck",
+        r"\bfuq\b": "fuck",
+        r"\bfck\b": "fuck",
+        r"\bshyt\b": "shit",
+        r"\bshit\b": "shit",
+        r"\bbiatch\b": "bitch",
+        r"\bbeatch\b": "bitch",
+        r"\basshole\b": "asshole",
+        r"\ba55hole\b": "asshole",
+        r"\btard\b": "retard",
+        r"\bfagg\b": "fag",
     }
 
     for pattern, replacement in evasion_patterns.items():
         result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
 
     # 6. Clean up multiple spaces
-    result = re.sub(r'\s+', ' ', result).strip()
+    result = re.sub(r"\s+", " ", result).strip()
 
     return result
+
 
 def aggregate_rationales(rationales, labels, post_length, drop_abnormal=False):
     """
@@ -159,7 +159,9 @@ def aggregate_rationales(rationales, labels, post_length, drop_abnormal=False):
     # Fallback: return zeros if no clear case matches
     return np.zeros(post_length).tolist()
 
+
 from typing import List, Tuple
+
 
 def preprocess_text(raw_text):
     preprocessed_text = raw_text
@@ -318,6 +320,7 @@ def align_rationales(tokens, rationales, tokenizer, max_length=128):
     inputs = {k: v for k, v in inputs.items() if v is not None}
     return inputs
 
+
 import re
 import json
 import os
@@ -343,10 +346,14 @@ def process_and_convert_data(
     post_id_divisions,
     save_path="Data/explanations/",
     drop_abnormal=False,
+    classification_mode="binary",
 ):
     """
     Combined function that processes raw entries and converts to ERASER format in one pass.
     Also splits data into train/val/test sets.
+
+    Args:
+        classification_mode: "binary" (normal vs toxic) or "multiclass" (normal vs hatespeech vs offensive)
     """
     print("Processing and converting data...")
 
@@ -366,11 +373,19 @@ def process_and_convert_data(
 
     for key, value in tqdm(data.items()):
         try:
-            # Extract labels
-            labels = [
-                1 if annot["label"] in ["hatespeech", "offensive"] else 0
-                for annot in value["annotators"]
-            ]
+            # Extract labels based on classification mode
+            if classification_mode == "binary":
+                # Binary: 0=normal, 1=toxic (hatespeech or offensive)
+                labels = [
+                    1 if annot["label"] in ["hatespeech", "offensive"] else 0
+                    for annot in value["annotators"]
+                ]
+            else:  # multiclass
+                # 3-class: 0=normal, 1=hatespeech, 2=offensive
+                label_map = {"normal": 0, "hatespeech": 1, "offensive": 2}
+                labels = [
+                    label_map.get(annot["label"], 0) for annot in value["annotators"]
+                ]
 
             # Process rationales
             rationales = value.get("rationales", [])

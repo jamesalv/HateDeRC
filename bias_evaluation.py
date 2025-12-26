@@ -60,15 +60,22 @@ from sklearn.metrics import roc_auc_score
 
 
 def calculate_gmb_metrics(
-    test_data: List[Dict[str, Any]], probabilities: np.ndarray, target_groups: List[str]
+    test_data: List[Dict[str, Any]],
+    probabilities: np.ndarray,
+    target_groups: List[str],
+    classification_mode: str = "binary",
 ):
     """
     Calculate GMB (Generalized Mean of Bias) AUC metrics from model predictions
 
+    Note: Bias evaluation always uses binary classification (toxic vs non-toxic).
+    If classification_mode is "multiclass", hatespeech and offensive are combined into one toxic class.
+
     Args:
-        probabilities: Model's probability outputs
+        probabilities: Model's probability outputs (shape: [n_samples, n_classes])
         test_data: List of test data entries
         target_groups: List of target groups to evaluate
+        classification_mode: "binary" or "multiclass"
 
     Returns:
         Dictionary with GMB metrics
@@ -78,8 +85,17 @@ def calculate_gmb_metrics(
     ground_truth = {}
 
     for idx, row in enumerate(test_data):
-        prediction_scores[idx] = probabilities[idx, 1]
-        ground_truth[idx] = row["hard_label"]
+        # Convert predictions to binary (toxic vs non-toxic)
+        if classification_mode == "multiclass":
+            # For 3-class: P(toxic) = P(hatespeech) + P(offensive)
+            binary_prob = probabilities[idx, 1] + probabilities[idx, 2]
+            prediction_scores[idx] = binary_prob
+            # Convert label: 0=normal, 1/2=toxic
+            ground_truth[idx] = 1 if row["hard_label"] > 0 else 0
+        else:
+            # For binary: use probability of class 1 (toxic)
+            prediction_scores[idx] = probabilities[idx, 1]
+            ground_truth[idx] = row["hard_label"]
 
     # Calculate metrics for each target group and method
     bias_metrics = {}

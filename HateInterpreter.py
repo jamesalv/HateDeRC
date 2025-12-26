@@ -32,11 +32,19 @@ class HateInterpreter:
     Creates modified datasets and uses DataLoader for efficient batched processing.
     """
 
-    def __init__(self, model, tokenizer, dataset_class, batch_size=32):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        dataset_class,
+        batch_size=32,
+        classification_mode="binary",
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.dataset_class = dataset_class
         self.batch_size = batch_size
+        self.classification_mode = classification_mode  # "binary" or "multiclass"
 
         # Get special token IDs
         self.special_token_ids = {
@@ -76,7 +84,11 @@ class HateInterpreter:
             attention_scores, attention_masks_list, input_ids_list, k
         )
 
-        hard_rationale_predictions, soft_rationale_predictions = self._convert_attention_to_evidence_format(input_ids_list, attention_scores, hard_predictions)
+        hard_rationale_predictions, soft_rationale_predictions = (
+            self._convert_attention_to_evidence_format(
+                input_ids_list, attention_scores, hard_predictions
+            )
+        )
 
         # 1. FAITHFULNESS METRICS
         print("[2/5] Computing comprehensiveness scores...")
@@ -91,22 +103,29 @@ class HateInterpreter:
 
         # 4. Convert to eraser format
         print("[4/5] Converting results to ERASER format and saving...")
-        results_eraser = self._convert_result_to_eraser_format(test_results, hard_rationale_predictions, soft_rationale_predictions, raw_sufficiency, raw_comprehensiveness)
+        results_eraser = self._convert_result_to_eraser_format(
+            test_results,
+            hard_rationale_predictions,
+            soft_rationale_predictions,
+            raw_sufficiency,
+            raw_comprehensiveness,
+        )
         # Convert to JSONL format
-        jsonl_output = '\n'.join([json.dumps(entry) for entry in results_eraser])
-        with open(eraser_save_path, 'w') as f:
+        jsonl_output = "\n".join([json.dumps(entry) for entry in results_eraser])
+        with open(eraser_save_path, "w") as f:
             f.write(jsonl_output)
-        
+
         # 5. Calculate ERASER metrics
         print("[5/5] Calculating ERASER metrics...")
-        
+
         return {
-            'comprehensiveness': float(np.average(comprehensiveness_scores)),
-            'sufficiency': float(np.average(sufficiency_scores)),
-            
+            "comprehensiveness": float(np.average(comprehensiveness_scores)),
+            "sufficiency": float(np.average(sufficiency_scores)),
         }
 
-    def _convert_attention_to_evidence_format(self, input_ids_list, attention_scores, hard_predictions):
+    def _convert_attention_to_evidence_format(
+        self, input_ids_list, attention_scores, hard_predictions
+    ):
         # 2. Collect evidence
         hard_rationale_predictions = []
         for idx, hp in enumerate(hard_predictions):
@@ -118,10 +137,12 @@ class HateInterpreter:
                 else:
                     start, end = span[0], span[1] + 1
 
-                evidences.append({
-                    "start_token": start,
-                    "end_token": end,
-                })
+                evidences.append(
+                    {
+                        "start_token": start,
+                        "end_token": end,
+                    }
+                )
             hard_rationale_predictions.append(evidences)
 
         soft_rationale_predictions = []
@@ -141,28 +162,34 @@ class HateInterpreter:
     ):
         all_entries = []
         for idx, data in enumerate(test_result["post_id"]):
-            entry = {
-            'annotation_id': data,
-            'classification': str(int(test_result["predictions"][idx])),
-            'classification_scores': {
-                0: float(test_result["probabilities"][idx][0]),
-                1: float(test_result["probabilities"][idx][1]),
-            },
-            'rationales': [
-                {
-                    "docid": data,
-                    "hard_rationale_predictions": hard_rationale_predictions[idx],
-                    "soft_rationale_predictions": [float(x) for x in soft_rationale_predictions[idx]],
-                }
-            ],
-            'sufficiency_classification_scores': {
-                0: float(sufficiency_scores[idx][0]),
-                1: float(sufficiency_scores[idx][1])
-            },
-            'comprehensiveness_classification_scores': {
-                0: float(comprehensiveness_scores[idx][0]),
-                1: float(comprehensiveness_scores[idx][1])
+            # Build classification_scores dynamically based on number of classes
+            num_classes = test_result["probabilities"][idx].shape[0]
+            classification_scores = {
+                i: float(test_result["probabilities"][idx][i])
+                for i in range(num_classes)
             }
+
+            entry = {
+                "annotation_id": data,
+                "classification": str(int(test_result["predictions"][idx])),
+                "classification_scores": classification_scores,
+                "rationales": [
+                    {
+                        "docid": data,
+                        "hard_rationale_predictions": hard_rationale_predictions[idx],
+                        "soft_rationale_predictions": [
+                            float(x) for x in soft_rationale_predictions[idx]
+                        ],
+                    }
+                ],
+                "sufficiency_classification_scores": {
+                    i: float(sufficiency_scores[idx][i])
+                    for i in range(sufficiency_scores[idx].shape[0])
+                },
+                "comprehensiveness_classification_scores": {
+                    i: float(comprehensiveness_scores[idx][i])
+                    for i in range(comprehensiveness_scores[idx].shape[0])
+                },
             }
             all_entries.append(entry)
 
@@ -199,7 +226,7 @@ class HateInterpreter:
             hard_predictions.append(pred_mask)
 
         return hard_predictions
-    
+
     def _compute_comprehensiveness(
         self,
         test_data: List[Dict],
@@ -230,7 +257,9 @@ class HateInterpreter:
 
         # Calculate comprehensiveness scores
         comprehensiveness_scores = []
-        for idx, (prob, label) in enumerate(zip(test_results["probabilities"], test_results['predictions'])):
+        for idx, (prob, label) in enumerate(
+            zip(test_results["probabilities"], test_results["predictions"])
+        ):
             original_prob = prob[
                 label
             ]  # Probability from normal prediction process for the label
@@ -270,7 +299,9 @@ class HateInterpreter:
 
         # Calculate sufficiency scores
         sufficiency_scores = []
-        for idx, (prob, label) in enumerate(zip(test_results["probabilities"], test_results['predictions'])):
+        for idx, (prob, label) in enumerate(
+            zip(test_results["probabilities"], test_results["predictions"])
+        ):
             original_prob = prob[
                 label
             ]  # Probability from normal prediction process for the label
@@ -338,5 +369,5 @@ class HateInterpreter:
             "input_ids": torch.tensor(input_ids).unsqueeze(0),
             "attention_mask": torch.tensor(new_mask).unsqueeze(0),
             "rationales": item["rationales"],
-            "hard_label": item["hard_label"]
+            "hard_label": item["hard_label"],
         }
