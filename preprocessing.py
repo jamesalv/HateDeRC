@@ -427,7 +427,7 @@ def process_and_convert_data(
             }
 
             # Convert to ERASER format if it's hateful/offensive content
-            if hard_label == 1 and save_path:
+            if (hard_label == 1 or hard_label == 2) and save_path:
                 input_ids_list = inputs["input_ids"].squeeze().tolist()
                 rationales_list = inputs["rationales"].squeeze().ceil().int().tolist()
 
