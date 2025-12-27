@@ -25,8 +25,12 @@ def get_bias_evaluation_samples(data, method, group):
         is_in_group = group in target_groups
 
         # Convert various label formats to binary toxic/non-toxic
+        # In the original code, anything that's NOT 'non-toxic' is considered toxic
+        # This includes both 'hatespeech' (label=1) and 'offensive' (label=2) in multiclass mode
         if "hard_label" in row:
-            is_toxic = row["hard_label"] == 1
+            is_toxic = (
+                row["hard_label"] > 0
+            )  # 0=non-toxic, >0=toxic (hatespeech or offensive)
         else:
             continue
 
