@@ -125,11 +125,15 @@ def calculate_gmb_metrics(
                 if post_id in ground_truth and post_id in prediction_scores:
                     y_true.append(ground_truth[post_id])
                     y_score.append(prediction_scores[post_id])
+                else:
+                    print(f"Missing data for positive post_id {post_id} in group {group} and method {method}")
 
             for post_id in negative_ids:
                 if post_id in ground_truth and post_id in prediction_scores:
                     y_true.append(ground_truth[post_id])
                     y_score.append(prediction_scores[post_id])
+                else:
+                    print(f"Missing data for negative post_id {post_id} in group {group} and method {method}")
 
             # Calculate AUC if we have enough samples with both classes
             if len(y_true) > 10 and len(set(y_true)) > 1:
