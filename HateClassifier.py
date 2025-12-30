@@ -91,7 +91,7 @@ class HateClassifier:
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # Layer configuration for debiasing (similar to BertDistill)
-        self.debias_layer = 3  # Layer index for auxiliary loss
+        self.debias_layer = getattr(config, "debias_layer", 2)  # Default to layer 3 (0-indexed)
         self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
 
         # Loss Weighting Configuration
