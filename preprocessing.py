@@ -408,11 +408,11 @@ def process_and_convert_data(
             hard_label = Counter(labels).most_common(1)[0][0]
             soft_label = sum(labels) / len(labels)
 
-            # Determine target groups (mentioned at least 3 times)
+            # Determine target groups (mentioned at least 2 times)
             target_groups = [
                 t for annot in value["annotators"] for t in annot["target"]
             ]
-            filtered_targets = [k for k, v in Counter(target_groups).items() if v > 2]
+            filtered_targets = [k for k, v in Counter(target_groups).items() if v > 1]
 
             # Create processed entry
             processed_entry = {
