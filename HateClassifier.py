@@ -20,25 +20,19 @@ from pathlib import Path
 
 class HateClassifier:
     """
-    HateDeRC: Hate Speech Detection with Debiasing Residual Connections.
+    Hate Speech Classifier with Optional Attention Supervision.
 
-    This classifier implements a novel architecture for binary hate speech detection
-    that reduces dependency on target-sensitive words (e.g., race, religion, gender).
+    This classifier implements binary/multi-class hate speech detection
+    with optional ranking-based attention supervision.
 
     Key Components:
     ---------------
-    1. **DeRC Mechanism (Debiasing Residual Connection)**:
-       - Creates a residual connection from lower layer (layer 3) to final layer
-       - Lower layers capture shallow, bias-prone patterns (target words)
-       - Final layer learns bias-independent features by incorporating debiased residuals
-       - Prevents over-reliance on lexical shortcuts
+    1. **Base Architecture**:
+       - Transformer encoder (BERT-like) for contextual embeddings
+       - Classification head on [CLS] token representation
+       - Standard cross-entropy loss for classification
 
-    2. **Multi-Layer Loss**:
-       - Auxiliary loss from debias layer (layer 3): guides early layers to learn useful representations
-       - Main loss from final layer: ensures correct final predictions
-       - Configurable weighting allows balancing between auxiliary and main objectives
-
-    3. **Ranking-Based Attention Supervision**:
+    2. **Ranking-Based Attention Supervision** (Optional):
        - Uses human token-level annotations as supervision signal
        - Employs pairwise ranking loss instead of cross-entropy (respects independent annotations)
        - Enforces: tokens with higher human importance should receive higher attention
@@ -46,20 +40,10 @@ class HateClassifier:
 
     Loss Function:
     --------------
-    Total Loss = α × lower_layer_loss + β × upper_layer_loss + λ × attention_ranking_loss
+    Total Loss = classification_loss + λ × attention_ranking_loss
 
     Where:
-    - α (lower_loss_weight): Weight for auxiliary classification loss
-    - β (upper_loss_weight): Weight for main classification loss
     - λ (lambda_attn): Weight for attention supervision loss
-
-    Architecture:
-    -------------
-    Input → BERT-like Encoder (all hidden states) → Multi-layer Classifiers
-                                ↓
-                          Layer 3 (debias) -----(residual)----→ Final Layer
-                                ↓                                    ↓
-                         Auxiliary Loss                        Main Loss
     """
 
     def __init__(self, config: TrainingConfig, **kwargs):
@@ -81,29 +65,14 @@ class HateClassifier:
 
         # Get model dimensions
         hidden_size = self.base_model.config.hidden_size
-        self.num_layers = self.base_model.config.num_hidden_layers
 
-        # Multi-layer classifier heads (one for each transformer layer)
-        self.classifier_list = nn.ModuleList(
-            [nn.Linear(hidden_size, config.num_labels) for _ in range(self.num_layers)]
-        )
+        # Classification head
+        self.classifier = nn.Linear(hidden_size, config.num_labels)
 
         # Dropout layer
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # Layer configuration for debiasing (similar to BertDistill)
-        self.debias_layer = getattr(
-            config, "debias_layer", 2
-        )  # Default to layer 3 (0-indexed)
-        self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
-
         # Loss Weighting Configuration
-        self.lower_loss_weight = getattr(
-            config, "lower_loss_weight", 0.5
-        )  # α: auxiliary loss weight
-        self.upper_loss_weight = getattr(
-            config, "upper_loss_weight", 0.5
-        )  # β: main loss weight
         self.lambda_attn = getattr(
             config, "lambda_attn", 0.1
         )  # λ: attention loss weight
@@ -119,7 +88,7 @@ class HateClassifier:
 
         # Move models to device
         self.base_model.to(self.device)
-        self.classifier_list.to(self.device)
+        self.classifier.to(self.device)
 
         # Configure loss function
         if config.class_weighting:
@@ -133,10 +102,8 @@ class HateClassifier:
         else:
             self.cls_criterion = CrossEntropyLoss()
 
-        # Configure optimizer (for base model and all classifiers)
-        params = list(self.base_model.parameters()) + list(
-            self.classifier_list.parameters()
-        )
+        # Configure optimizer (for base model and classifier)
+        params = list(self.base_model.parameters()) + list(self.classifier.parameters())
         self.optimizer = AdamW(params, lr=config.learning_rate)
 
         # Learning rate scheduler (initialized in train() method)
@@ -170,19 +137,17 @@ class HateClassifier:
 
     def train_epoch(self, train_dataloader):
         """
-        Train for one epoch using the HateDeRC architecture.
+        Train for one epoch.
 
         Returns:
             float: Average total loss for the epoch
         """
         self.base_model.train()
-        for classifier in self.classifier_list:
-            classifier.train()
+        self.classifier.train()
 
         # Track individual loss components for monitoring
         total_loss = 0
         total_cls_loss = 0
-        total_lower_loss = 0
         total_attn_loss = 0
         num_batches = 0
 
@@ -194,41 +159,20 @@ class HateClassifier:
 
             # Mixed precision context
             with autocast(device_type="cuda", enabled=self.use_amp):
-                # Forward Pass through base model (get all hidden states)
+                # Forward Pass through base model
                 outputs = self.base_model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_hidden_states=True,
                     output_attentions=self.train_attention,
                 )
 
-                # Get hidden states from all layers
-                hidden_states = outputs.hidden_states  # Tuple of (num_layers+1) tensors
+                # Get CLS token representation
+                cls_token = outputs.last_hidden_state[:, 0, :]
+                logits = self.classifier(self.dropout(cls_token))
 
-                # Apply pooling to each layer's hidden state (extract CLS token)
-                # Note: hidden_states[0] is embeddings, hidden_states[1:] are transformer layers
-                pooled_outputs = []
-                for i in range(1, len(hidden_states)):  # Skip embeddings layer
-                    cls_token = hidden_states[i][:, 0, :]  # Get CLS token
-                    pooled_outputs.append(cls_token)
-
-                # Get logits from all classifier heads
-                logits_list = []
-                for i, pooled_output in enumerate(pooled_outputs):
-                    if i == len(pooled_outputs) - 1 and self.use_multi_layer_loss:
-                        # Last layer: add residual connection from debias layer
-                        combined = (
-                            self.dropout(pooled_output)
-                            + self.dropout(pooled_outputs[self.debias_layer]).detach()
-                        )
-                        logits = self.classifier_list[i](combined)
-                    else:
-                        logits = self.classifier_list[i](self.dropout(pooled_output))
-                    logits_list.append(logits)
-
-                # Calculate unified loss with all components
+                # Calculate loss
                 loss_dict = self._calculate_loss(
-                    logits_list=logits_list,
+                    logits=logits,
                     labels=labels,
                     attention_mask=attention_mask,
                     attentions=outputs.attentions if self.train_attention else None,
@@ -240,10 +184,7 @@ class HateClassifier:
                 loss = loss_dict["total_loss"]
 
                 # Track individual loss components
-                if "cls_loss" in loss_dict:
-                    total_cls_loss += loss_dict["cls_loss"]
-                if "lower_loss" in loss_dict:
-                    total_lower_loss += loss_dict["lower_loss"]
+                total_cls_loss += loss_dict["cls_loss"]
                 if "attn_loss" in loss_dict:
                     total_attn_loss += loss_dict["attn_loss"]
 
@@ -268,7 +209,7 @@ class HateClassifier:
                         self.base_model.parameters(), self.max_grad_norm
                     )
                     torch.nn.utils.clip_grad_norm_(
-                        self.classifier_list.parameters(), self.max_grad_norm
+                        self.classifier.parameters(), self.max_grad_norm
                     )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -277,7 +218,7 @@ class HateClassifier:
                         self.base_model.parameters(), self.max_grad_norm
                     )
                     torch.nn.utils.clip_grad_norm_(
-                        self.classifier_list.parameters(), self.max_grad_norm
+                        self.classifier.parameters(), self.max_grad_norm
                     )
                     self.optimizer.step()
 
@@ -287,13 +228,10 @@ class HateClassifier:
                     self.scheduler.step()
 
             # Update progress bar with relevant loss components
-            postfix = {"total": total_loss / num_batches}
-
-            if self.use_multi_layer_loss:
-                postfix["main"] = total_cls_loss / num_batches
-                postfix["aux"] = total_lower_loss / num_batches
-            else:
-                postfix["cls"] = total_cls_loss / num_batches
+            postfix = {
+                "total": total_loss / num_batches,
+                "cls": total_cls_loss / num_batches,
+            }
 
             if self.train_attention and total_attn_loss > 0:
                 postfix["attn"] = total_attn_loss / num_batches
@@ -304,8 +242,7 @@ class HateClassifier:
 
     def evaluate(self, val_dataloader):
         self.base_model.eval()
-        for classifier in self.classifier_list:
-            classifier.eval()
+        self.classifier.eval()
 
         total_loss = 0
         all_preds = []
@@ -321,17 +258,17 @@ class HateClassifier:
 
                 # Mixed precision context for evaluation
                 with autocast(device_type="cuda", enabled=self.use_amp):
-                    # Forward pass through base model (no hidden states needed - more efficient)
+                    # Forward pass through base model
                     outputs = self.base_model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                     )
 
-                    # Get final layer's CLS token (for evaluation, only use final classifier)
+                    # Get CLS token representation
                     cls_token = outputs.last_hidden_state[:, 0, :]
 
-                    # Get logits from final classifier (no dropout in eval mode)
-                    logits = self.classifier_list[-1](cls_token)
+                    # Get logits from classifier (no dropout in eval mode)
+                    logits = self.classifier(cls_token)
 
                     # Calculate loss
                     loss = self.cls_criterion(logits, labels)
@@ -355,27 +292,19 @@ class HateClassifier:
 
     def train(self, train_dataloader, val_dataloader):
         """
-        Train the HateDeRC model with multi-component loss.
-        
+        Train the hate speech classifier.
+
         Training Configuration:
-        - DeRC: Residual connection from layer 3 to final layer
-        - Multi-layer loss: Auxiliary (layer 3) + Main (final layer)
-        - Attention supervision: Ranking-based loss from human annotations
-        
-        Loss Weights:
-        - Lower loss: {:.2f}
-        - Upper loss: {:.2f}  
-        - Attention: {:.2f}
-        
+        - Classification loss: Cross-entropy on predicted labels
+        - Attention supervision (optional): Ranking-based loss from human annotations
+
         Args:
             train_dataloader: DataLoader for training data
             val_dataloader: DataLoader for validation data
-            
+
         Returns:
             dict: Training history with loss and metrics per epoch
-        """.format(
-            self.lower_loss_weight, self.upper_loss_weight, self.lambda_attn
-        )
+        """
         print(f"Training on device: {self.device}")
         print(f"Model: {self.config.model_name}")
         print(f"Epochs: {self.config.num_epochs}")
@@ -388,12 +317,7 @@ class HateClassifier:
         print(f"Mixed precision (AMP): {self.use_amp}")
         print(f"Gradient clipping: {self.max_grad_norm}")
         print(f"\nLoss Configuration:")
-        print(f"  Multi-layer loss: {self.use_multi_layer_loss}")
-        if self.use_multi_layer_loss:
-            print(
-                f"    - Auxiliary (layer {self.debias_layer}): α={self.lower_loss_weight}"
-            )
-            print(f"    - Main (final layer): β={self.upper_loss_weight}")
+        print(f"  Classification loss: Cross-entropy")
         print(f"  Attention supervision: {self.train_attention}")
         if self.train_attention:
             print(f"    - Ranking loss: λ={self.lambda_attn}")
@@ -481,10 +405,10 @@ class HateClassifier:
         # Save base model
         self.base_model.save_pretrained(save_path)
 
-        # Save all classifier heads and optimizer state
+        # Save classifier and optimizer state
         torch.save(
             {
-                "classifier_list_state_dict": self.classifier_list.state_dict(),
+                "classifier_state_dict": self.classifier.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "config": self.config,
             },
@@ -499,10 +423,10 @@ class HateClassifier:
         self.base_model = AutoModel.from_pretrained(load_path)
         self.base_model.to(self.device)
 
-        # Load all classifier heads and optimizer state
+        # Load classifier and optimizer state
         # Note: weights_only=False is safe for your own checkpoints
         checkpoint = torch.load(load_path / "training_state.pt", weights_only=False)
-        self.classifier_list.load_state_dict(checkpoint["classifier_list_state_dict"])
+        self.classifier.load_state_dict(checkpoint["classifier_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         print(f"Model loaded from: {load_path}")
@@ -527,22 +451,19 @@ class HateClassifier:
         else:
             print(f"No training history found at: {history_path}")
 
-    def predict(
-        self, test_dataloader, return_layer_outputs=False, return_attentions=False
-    ):
+    def predict(self, test_dataloader, return_attentions=False):
         """
         Run inference on test data and return predictions with metrics.
 
         Args:
             test_dataloader: DataLoader for test data
-            return_layer_outputs: If True, returns predictions from all layers
+            return_attentions: If True, returns attention weights
 
         Returns:
             dict: Contains predictions, true labels, probabilities, loss, accuracy, and F1 score
         """
         self.base_model.eval()
-        for classifier in self.classifier_list:
-            classifier.eval()
+        self.classifier.eval()
 
         total_loss = 0
         all_preds = []
@@ -550,9 +471,6 @@ class HateClassifier:
         all_probs = []
         all_attention_weights = []
         all_post_ids = []
-        all_layer_preds = (
-            [[] for _ in range(self.num_layers)] if return_layer_outputs else None
-        )
 
         print(f"Running inference on {len(test_dataloader)} batches...")
 
@@ -567,16 +485,15 @@ class HateClassifier:
 
                 # Mixed precision context for inference
                 with autocast(device_type="cuda", enabled=self.use_amp):
-                    # Forward pass through base model (only request hidden states if needed)
+                    # Forward pass through base model
                     outputs = self.base_model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        output_hidden_states=return_layer_outputs,
                         output_attentions=return_attentions,
                     )
 
                     cls_token = outputs.last_hidden_state[:, 0, :]
-                    logits = self.classifier_list[-1](cls_token)
+                    logits = self.classifier(cls_token)
 
                     # Calculate loss
                     loss = self.cls_criterion(logits, labels)
@@ -598,15 +515,6 @@ class HateClassifier:
                         all_attention_weights.extend(attention_result)
                     else:
                         print("No attention weights extracted.")
-
-                # Optionally get predictions from all layers
-                if return_layer_outputs and all_layer_preds is not None:
-                    hidden_states = outputs.hidden_states[1:]  # Skip embeddings
-                    for i, hidden_state in enumerate(hidden_states):
-                        layer_cls = hidden_state[:, 0, :]
-                        layer_logits = self.classifier_list[i](layer_cls)
-                        layer_preds = torch.argmax(layer_logits, dim=1)
-                        all_layer_preds[i].extend(layer_preds.cpu().numpy())
 
         # Convert to numpy arrays
         all_preds = np.array(all_preds)
@@ -635,11 +543,6 @@ class HateClassifier:
             "accuracy": accuracy,
             "f1": f1,
         }
-
-        if return_layer_outputs and all_layer_preds is not None:
-            results["layer_predictions"] = [
-                np.array(preds) for preds in all_layer_preds
-            ]
 
         if return_attentions:
             results["attentions"] = all_attention_weights
@@ -707,7 +610,7 @@ class HateClassifier:
 
     def _calculate_loss(
         self,
-        logits_list,
+        logits,
         labels,
         attention_mask,
         attentions=None,
@@ -716,13 +619,12 @@ class HateClassifier:
         """
         Calculate unified loss with configurable component weights.
 
-        This method computes the total loss as a weighted combination of:
-        1. Classification loss (auxiliary from debias layer if multi-layer enabled)
-        2. Main classification loss (from final layer)
-        3. Attention ranking loss (if attention supervision enabled)
+        This method computes the total loss as a combination of:
+        1. Classification loss (cross-entropy)
+        2. Attention ranking loss (if attention supervision enabled)
 
         Args:
-            logits_list: List of logits from all classifier heads
+            logits: Logits from classifier head (batch_size, num_labels)
             labels: Ground truth labels (batch_size,)
             attention_mask: Attention mask for padding (batch_size, seq_len)
             attentions: Tuple of attention tensors from model (optional)
@@ -730,40 +632,18 @@ class HateClassifier:
 
         Returns:
             dict: Dictionary containing:
-                - 'total_loss': Weighted sum of all loss components
-                - 'cls_loss': Main classification loss (if applicable)
-                - 'lower_loss': Auxiliary classification loss (if multi-layer enabled)
+                - 'total_loss': Sum of all loss components
+                - 'cls_loss': Classification loss
                 - 'attn_loss': Attention ranking loss (if attention training enabled)
         """
         loss_dict = {}
 
-        # Main logits from final layer
-        final_logits = logits_list[-1]
-
-        # Component 1 & 2: Classification Losses
-        if self.use_multi_layer_loss:
-            # Auxiliary loss from debias layer (helps guide lower layer representations)
-            lower_loss = self.cls_criterion(logits_list[self.debias_layer], labels)
-
-            # Main loss from final layer (with residual connection)
-            upper_loss = self.cls_criterion(final_logits, labels)
-
-            # Weighted combination: Total = α × lower + β × upper
-            cls_loss = (
-                self.lower_loss_weight * lower_loss
-                + self.upper_loss_weight * upper_loss
-            )
-
-            loss_dict["lower_loss"] = lower_loss.item()
-            loss_dict["cls_loss"] = upper_loss.item()
-        else:
-            # Single loss from final layer only (baseline)
-            cls_loss = self.cls_criterion(final_logits, labels)
-            loss_dict["cls_loss"] = cls_loss.item()
-
+        # Classification loss
+        cls_loss = self.cls_criterion(logits, labels)
+        loss_dict["cls_loss"] = cls_loss.item()
         total_loss = cls_loss
 
-        # Component 3: Attention Ranking Loss
+        # Attention Ranking Loss
         if (
             self.train_attention
             and attentions is not None

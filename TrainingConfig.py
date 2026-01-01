@@ -23,11 +23,7 @@ class TrainingConfig:
     lambda_attn: float = 0.1
     ranking_margin: float = 0.1  # Minimum margin between token pairs
     ranking_threshold: float = 0.05  # Min difference to consider pairs significant
-    use_multi_layer_loss: bool = False
-    lower_loss_weight: float = 0.5  # Weight for auxiliary loss from debias layer
-    upper_loss_weight: float = 0.5  # Weight for main classification loss
     hidden_dropout_prob: float = 0
-    debias_layer: int = 2  # Layer index for debiasing (0-indexed)
 
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)
