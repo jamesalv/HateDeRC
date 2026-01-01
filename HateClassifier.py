@@ -129,10 +129,12 @@ class HateClassifier:
 
         # Training history
         self.history = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_accuracy": [],
-            "val_f1": [],
+            "train_loss": [],  # Per epoch
+            "val_loss": [],  # Per epoch
+            "val_accuracy": [],  # Per epoch
+            "val_f1": [],  # Per epoch
+            "train_cls_loss_steps": [],  # Per step (for plotting)
+            "train_attn_loss_steps": [],  # Per step (for plotting)
         }
 
     def train_epoch(self, train_dataloader):
@@ -187,6 +189,13 @@ class HateClassifier:
                 total_cls_loss += loss_dict["cls_loss"]
                 if "attn_loss" in loss_dict:
                     total_attn_loss += loss_dict["attn_loss"]
+
+                # Record per-step losses for plotting
+                self.history["train_cls_loss_steps"].append(loss_dict["cls_loss"])
+                if "attn_loss" in loss_dict:
+                    self.history["train_attn_loss_steps"].append(loss_dict["attn_loss"])
+                else:
+                    self.history["train_attn_loss_steps"].append(0.0)
 
                 # Scale loss for gradient accumulation
                 loss = loss / self.gradient_accumulation_steps
