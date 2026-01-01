@@ -26,18 +26,7 @@ class HateClassifier:
 
     Key Components:
     ---------------
-    1. **DeRC Mechanism (Debiasing Residual Connection)**:
-       - Creates a residual connection from lower layer (layer 3) to final layer
-       - Lower layers capture shallow, bias-prone patterns (target words)
-       - Final layer learns bias-independent features by incorporating debiased residuals
-       - Prevents over-reliance on lexical shortcuts
-
-    2. **Multi-Layer Loss**:
-       - Auxiliary loss from debias layer (layer 3): guides early layers to learn useful representations
-       - Main loss from final layer: ensures correct final predictions
-       - Configurable weighting allows balancing between auxiliary and main objectives
-
-    3. **Ranking-Based Attention Supervision**:
+    **Ranking-Based Attention Supervision**:
        - Uses human token-level annotations as supervision signal
        - Employs pairwise ranking loss instead of cross-entropy (respects independent annotations)
        - Enforces: tokens with higher human importance should receive higher attention
@@ -45,20 +34,10 @@ class HateClassifier:
 
     Loss Function:
     --------------
-    Total Loss = α × lower_layer_loss + β × upper_layer_loss + λ × attention_ranking_loss
+    Total Loss = CLS Loss + λ × attention_ranking_loss
 
     Where:
-    - α (lower_loss_weight): Weight for auxiliary classification loss
-    - β (upper_loss_weight): Weight for main classification loss
     - λ (lambda_attn): Weight for attention supervision loss
-
-    Architecture:
-    -------------
-    Input → BERT-like Encoder (all hidden states) → Multi-layer Classifiers
-                                ↓
-                          Layer 3 (debias) -----(residual)----→ Final Layer
-                                ↓                                    ↓
-                         Auxiliary Loss                        Main Loss
     """
 
     def __init__(self, config: TrainingConfig, **kwargs):
@@ -90,17 +69,6 @@ class HateClassifier:
         # Dropout layer
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # Layer configuration for debiasing (similar to BertDistill)
-        self.debias_layer = getattr(config, "debias_layer", 2)  # Default to layer 3 (0-indexed)
-        self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
-
-        # Loss Weighting Configuration
-        self.lower_loss_weight = getattr(
-            config, "lower_loss_weight", 0.5
-        )  # α: auxiliary loss weight
-        self.upper_loss_weight = getattr(
-            config, "upper_loss_weight", 0.5
-        )  # β: main loss weight
         self.lambda_attn = getattr(
             config, "lambda_attn", 0.1
         )  # λ: attention loss weight
@@ -210,15 +178,7 @@ class HateClassifier:
                 # Get logits from all classifier heads
                 logits_list = []
                 for i, pooled_output in enumerate(pooled_outputs):
-                    if i == len(pooled_outputs) - 1 and self.use_multi_layer_loss:
-                        # Last layer: add residual connection from debias layer
-                        combined = (
-                            self.dropout(pooled_output)
-                            + self.dropout(pooled_outputs[self.debias_layer]).detach()
-                        )
-                        logits = self.classifier_list[i](combined)
-                    else:
-                        logits = self.classifier_list[i](self.dropout(pooled_output))
+                    logits = self.classifier_list[i](self.dropout(pooled_output))
                     logits_list.append(logits)
 
                 # Calculate unified loss with all components
@@ -283,13 +243,7 @@ class HateClassifier:
 
             # Update progress bar with relevant loss components
             postfix = {"total": total_loss / num_batches}
-
-            if self.use_multi_layer_loss:
-                postfix["main"] = total_cls_loss / num_batches
-                postfix["aux"] = total_lower_loss / num_batches
-            else:
-                postfix["cls"] = total_cls_loss / num_batches
-
+            postfix["cls"] = total_cls_loss / num_batches
             if self.train_attention and total_attn_loss > 0:
                 postfix["attn"] = total_attn_loss / num_batches
 
@@ -353,13 +307,9 @@ class HateClassifier:
         Train the HateDeRC model with multi-component loss.
         
         Training Configuration:
-        - DeRC: Residual connection from layer 3 to final layer
-        - Multi-layer loss: Auxiliary (layer 3) + Main (final layer)
         - Attention supervision: Ranking-based loss from human annotations
         
         Loss Weights:
-        - Lower loss: {:.2f}
-        - Upper loss: {:.2f}  
         - Attention: {:.2f}
         
         Args:
@@ -369,7 +319,7 @@ class HateClassifier:
         Returns:
             dict: Training history with loss and metrics per epoch
         """.format(
-            self.lower_loss_weight, self.upper_loss_weight, self.lambda_attn
+            self.lambda_attn
         )
         print(f"Training on device: {self.device}")
         print(f"Model: {self.config.model_name}")
@@ -383,12 +333,6 @@ class HateClassifier:
         print(f"Mixed precision (AMP): {self.use_amp}")
         print(f"Gradient clipping: {self.max_grad_norm}")
         print(f"\nLoss Configuration:")
-        print(f"  Multi-layer loss: {self.use_multi_layer_loss}")
-        if self.use_multi_layer_loss:
-            print(
-                f"    - Auxiliary (layer {self.debias_layer}): α={self.lower_loss_weight}"
-            )
-            print(f"    - Main (final layer): β={self.upper_loss_weight}")
         print(f"  Attention supervision: {self.train_attention}")
         if self.train_attention:
             print(f"    - Ranking loss: λ={self.lambda_attn}")
@@ -427,11 +371,6 @@ class HateClassifier:
                 self.save_model("best_model")
                 print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
 
-            # Save checkpoint every epoch
-            # self.save_model(f"checkpoint_epoch_{epoch + 1}")
-
-        # Save final model and training history
-        # self.save_model("final_model")
         self.save_history()
 
         print("\n" + "=" * 60)
@@ -702,7 +641,6 @@ class HateClassifier:
             dict: Dictionary containing:
                 - 'total_loss': Weighted sum of all loss components
                 - 'cls_loss': Main classification loss (if applicable)
-                - 'lower_loss': Auxiliary classification loss (if multi-layer enabled)
                 - 'attn_loss': Attention ranking loss (if attention training enabled)
         """
         loss_dict = {}
@@ -710,27 +648,9 @@ class HateClassifier:
         # Main logits from final layer
         final_logits = logits_list[-1]
 
-        # Component 1 & 2: Classification Losses
-        if self.use_multi_layer_loss:
-            # Auxiliary loss from debias layer (helps guide lower layer representations)
-            lower_loss = self.cls_criterion(logits_list[self.debias_layer], labels)
-
-            # Main loss from final layer (with residual connection)
-            upper_loss = self.cls_criterion(final_logits, labels)
-
-            # Weighted combination: Total = α × lower + β × upper
-            cls_loss = (
-                self.lower_loss_weight * lower_loss
-                + self.upper_loss_weight * upper_loss
-            )
-
-            loss_dict["lower_loss"] = lower_loss.item()
-            loss_dict["cls_loss"] = upper_loss.item()
-        else:
-            # Single loss from final layer only (baseline)
-            cls_loss = self.cls_criterion(final_logits, labels)
-            loss_dict["cls_loss"] = cls_loss.item()
-
+        # Single loss from final layer only (baseline)
+        cls_loss = self.cls_criterion(final_logits, labels)
+        loss_dict["cls_loss"] = cls_loss.item()
         total_loss = cls_loss
 
         # Component 3: Attention Ranking Loss
