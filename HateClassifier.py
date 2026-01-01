@@ -7,6 +7,7 @@ from torch.amp import autocast, GradScaler  # type: ignore
 from transformers import (
     AutoModel,  # pyright: ignore[reportPrivateImportUsage]
     AutoConfig,  # pyright: ignore[reportPrivateImportUsage]
+    get_linear_schedule_with_warmup,  # pyright: ignore[reportPrivateImportUsage]
 )
 from tqdm import tqdm
 import numpy as np
@@ -91,7 +92,9 @@ class HateClassifier:
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # Layer configuration for debiasing (similar to BertDistill)
-        self.debias_layer = getattr(config, "debias_layer", 2)  # Default to layer 3 (0-indexed)
+        self.debias_layer = getattr(
+            config, "debias_layer", 2
+        )  # Default to layer 3 (0-indexed)
         self.use_multi_layer_loss = getattr(config, "use_multi_layer_loss", False)
 
         # Loss Weighting Configuration
@@ -136,8 +139,10 @@ class HateClassifier:
         )
         self.optimizer = AdamW(params, lr=config.learning_rate)
 
-        # Learning rate scheduler
+        # Learning rate scheduler (initialized in train() method)
         self.scheduler = None
+        self.warmup_steps = getattr(config, "warmup_steps", 0)  # Default: no warmup
+        self.warmup_ratio = getattr(config, "warmup_ratio", 0.1)  # Default: 10% warmup
 
         # Mixed precision training
         self.use_amp = config.use_amp and torch.cuda.is_available()
@@ -395,6 +400,31 @@ class HateClassifier:
             print(
                 f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}"
             )
+        print("=" * 60)
+
+        # Initialize learning rate scheduler
+        num_training_steps = (
+            len(train_dataloader)
+            * self.config.num_epochs
+            // self.gradient_accumulation_steps
+        )
+        if self.warmup_steps > 0:
+            warmup_steps = self.warmup_steps
+        else:
+            warmup_steps = int(num_training_steps * self.warmup_ratio)
+
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        print(f"\nLearning Rate Schedule:")
+        print(f"  Total training steps: {num_training_steps}")
+        print(
+            f"  Warmup steps: {warmup_steps} ({warmup_steps/num_training_steps*100:.1f}%)"
+        )
+        print(f"  Initial LR: {self.config.learning_rate}")
         print("=" * 60)
 
         best_f1 = 0.0
