@@ -3,28 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 from typing import List, Dict, Tuple
 import json
-from sklearn.metrics import (
-    precision_recall_curve,
-    auc,
-    f1_score,
-    precision_score,
-    recall_score,
-)
 from preprocessing import find_ranges
-
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from typing import List, Dict, Tuple
-import json
-from sklearn.metrics import (
-    precision_recall_curve,
-    auc,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-
 
 class HateInterpreter:
     """
