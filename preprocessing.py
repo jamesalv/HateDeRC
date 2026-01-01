@@ -166,7 +166,7 @@ from typing import List, Tuple
 def preprocess_text(raw_text):
     preprocessed_text = raw_text
     # # Remove HTML tags <>
-    preprocessed_text = preprocessed_text.replace("<", "").replace(">", "")
+    preprocessed_text = re.sub(r'<[^>]*>', '', preprocessed_text)
     # # De-Obsfucate Patterns
     preprocessed_text = deobfuscate_text(preprocessed_text)
 
