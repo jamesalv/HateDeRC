@@ -697,6 +697,7 @@ class HateClassifier:
                     # ─────────────────────
                     if non_rationale_mask.any():
                         nr_entropy = entropy[non_rationale_mask]
+                        entropy = entropy.mean(0)
 
                         # Classic EAR: maximize entropy → minimize negative entropy
                         non_rationale_loss = -nr_entropy.mean()
@@ -852,6 +853,6 @@ class HateClassifier:
             )
             entropy = entropy / max_entropy
 
-            token_entropies.append(neg_entropy)
+            token_entropies.append(entropy)
 
         return token_entropies
