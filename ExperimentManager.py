@@ -66,7 +66,7 @@ class ExperimentManager:
             "lr": config.learning_rate,
             "bs": config.batch_size,
             "ep": config.num_epochs,
-            "ml": config.use_multi_layer_loss,
+            "ear" : config.attn_regularization
         }
         config_str = json.dumps(config_dict, sort_keys=True)
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
