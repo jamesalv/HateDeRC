@@ -22,16 +22,18 @@ class TrainingConfig:
     early_stopping_patience: int = (
         2  # Stop if no improvement for N epochs (0 = disabled)
     )
+    hidden_dropout_prob: float = 0.1
+    
+    # Attention-based Ranking Loss Parameters
     train_attention: bool = False
     lambda_attn: float = 0.1
     ranking_margin: float = 0.1  # Minimum margin between token pairs
     ranking_threshold: float = 0.05  # Min difference to consider pairs significant
-    use_multi_layer_loss: bool = False
-    lower_loss_weight: float = 0.5  # Weight for auxiliary loss from debias layer
-    upper_loss_weight: float = 0.5  # Weight for main classification loss
-    hidden_dropout_prob: float = 0
-    debias_layer: int = 2  # Layer index for debiasing (0-indexed)
 
+    # Entropy Regularization Parameters
+    train_entropy: bool = False
+    alpha_entropy: float = 0.01  # Weight for entropy loss component
+    
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)
     gradient_accumulation_steps: int = (

@@ -66,7 +66,6 @@ class ExperimentManager:
             "lr": config.learning_rate,
             "bs": config.batch_size,
             "ep": config.num_epochs,
-            "ml": config.use_multi_layer_loss,
         }
         config_str = json.dumps(config_dict, sort_keys=True)
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
@@ -148,7 +147,6 @@ class ExperimentManager:
             "batch_size": config.batch_size,
             "num_epochs": config.num_epochs,
             "train_attention": config.train_attention,
-            "use_multi_layer_loss": config.use_multi_layer_loss,
             "hidden_dropout_prob": config.hidden_dropout_prob,
             # Optimization Parameters
             "use_amp": config.use_amp,

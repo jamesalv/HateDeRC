@@ -34,10 +34,11 @@ class HateClassifier:
 
     Loss Function:
     --------------
-    Total Loss = CLS Loss + λ × attention_ranking_loss
+    Total Loss = CLS Loss + λ × attention_ranking_loss + α × entropy_loss
 
     Where:
     - λ (lambda_attn): Weight for attention supervision loss
+    - α (alpha_entropy): Weight for entropy loss
     """
 
     def __init__(self, config: TrainingConfig, **kwargs):
@@ -72,6 +73,12 @@ class HateClassifier:
         self.ranking_threshold = getattr(
             config, "ranking_threshold", 0.05
         )  # Threshold for significant pairs
+
+        # Entropy Loss Configuration
+        self.train_entropy = getattr(config, "train_entropy", False)
+        self.alpha_entropy = getattr(
+            config, "alpha_entropy", 0.01
+        )  # α: entropy loss weight
 
         # Move model to device
         self.model.to(self.device)
@@ -131,6 +138,7 @@ class HateClassifier:
         total_loss = 0
         total_cls_loss = 0
         total_attn_loss = 0
+        total_entropy_loss = 0
         num_batches = 0
 
         progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
@@ -145,7 +153,7 @@ class HateClassifier:
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_attentions=self.train_attention,
+                    output_attentions=self.train_attention or self.train_entropy,
                 )
 
                 # Get logits from model
@@ -156,7 +164,11 @@ class HateClassifier:
                     logits=logits,
                     labels=labels,
                     attention_mask=attention_mask,
-                    attentions=outputs.attentions if self.train_attention else None,
+                    attentions=(
+                        outputs.attentions
+                        if (self.train_attention or self.train_entropy)
+                        else None
+                    ),
                     human_rationales=(
                         batch.get("rationales") if self.train_attention else None
                     ),
@@ -168,6 +180,8 @@ class HateClassifier:
                 total_cls_loss += loss_dict["cls_loss"]
                 if "attn_loss" in loss_dict:
                     total_attn_loss += loss_dict["attn_loss"]
+                if "entropy_loss" in loss_dict:
+                    total_entropy_loss += loss_dict["entropy_loss"]
 
                 # Scale loss for gradient accumulation
                 loss = loss / self.gradient_accumulation_steps
@@ -207,6 +221,8 @@ class HateClassifier:
             postfix["cls"] = total_cls_loss / num_batches
             if self.train_attention and total_attn_loss > 0:
                 postfix["attn"] = total_attn_loss / num_batches
+            if self.train_entropy and total_entropy_loss != 0:
+                postfix["entropy"] = total_entropy_loss / num_batches
 
             progress_bar.set_postfix(postfix)
 
@@ -295,6 +311,9 @@ class HateClassifier:
             print(
                 f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}"
             )
+        print(f"  Entropy maximization: {self.train_entropy}")
+        if self.train_entropy:
+            print(f"    - Entropy loss: α={self.alpha_entropy}")
         print("=" * 60)
 
         best_f1 = 0.0
@@ -331,12 +350,21 @@ class HateClassifier:
                 print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
             else:
                 patience_counter += 1
-                print(f"  No improvement (patience: {patience_counter}/{early_stopping_patience})")
-                
+                print(
+                    f"  No improvement (patience: {patience_counter}/{early_stopping_patience})"
+                )
+
                 # Early stopping check
-                if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
-                    print(f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs.")
-                    print(f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})")
+                if (
+                    early_stopping_patience > 0
+                    and patience_counter >= early_stopping_patience
+                ):
+                    print(
+                        f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs."
+                    )
+                    print(
+                        f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})"
+                    )
                     break
 
         self.save_history()
@@ -573,6 +601,7 @@ class HateClassifier:
         This method computes the total loss as a combination of:
         1. Classification loss (cross-entropy)
         2. Attention ranking loss (if attention supervision enabled)
+        3. Entropy loss (if entropy maximization enabled)
 
         Args:
             logits: Logits from classifier (batch_size, num_labels)
@@ -614,6 +643,20 @@ class HateClassifier:
 
                 total_loss = total_loss + attn_loss
                 loss_dict["attn_loss"] = attn_loss.item()
+
+        # Entropy Loss (maximize entropy = minimize negative entropy)
+        if self.train_entropy and attentions is not None:
+            if len(attentions) > 0:
+                # Compute negative entropy across layers
+                neg_entropy = self.compute_negative_entropy(attentions, attention_mask)
+
+                # Entropy loss: α * negative_entropy
+                # When negative_entropy is more negative (high entropy), loss contribution is negative
+                # This rewards high entropy (spread attention)
+                entropy_loss = self.alpha_entropy * neg_entropy
+
+                total_loss = total_loss + entropy_loss
+                loss_dict["entropy_loss"] = entropy_loss.item()
 
         loss_dict["total_loss"] = total_loss
         return loss_dict
@@ -699,3 +742,50 @@ class HateClassifier:
 
         avg_loss = total_loss / total_pairs
         return self.lambda_attn * avg_loss
+
+    def compute_negative_entropy(
+        self, inputs: tuple, attention_mask: torch.Tensor, return_values=False
+    ):
+        """Compute the negative entropy across layers of a network for given inputs.
+
+        Args:
+            - inputs: tuple. Tuple of length num_layers. Each item should be in the form: BHSS
+            - attention_mask. Tensor with dim: BS
+
+        Code adapted from:
+        Attanasio, G., Nozza, D., Hovy, D., & Baralis, E.
+        "Entropy-based Attention Regularization Frees Unintended Bias Mitigation from Lists".
+        In Findings of the Association for Computational Linguistics: ACL2022.
+        Association for Computational Linguistics, 2022.
+        """
+        inputs_stacked = torch.stack(inputs)  #  LayersBatchHeadsSeqlenSeqlen
+        assert inputs_stacked.ndim == 5, "Here we expect 5 dimensions in the form LBHSS"
+
+        #  average over attention heads
+        pool_heads = inputs_stacked.mean(2)
+        batch_size = pool_heads.shape[1]
+        samples_entropy = list()
+        neg_entropies = list()
+        for b in range(batch_size):
+            #  get inputs from non-padded tokens of the current sample
+            mask = attention_mask[b]
+            sample = pool_heads[:, b, mask.bool(), :]
+            sample = sample[:, :, mask.bool()]
+
+            #  get the negative entropy for each non-padded token
+            neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
+            if return_values:
+                neg_entropies.append(neg_entropy.detach())
+
+            #  get the "average entropy" that traverses the layer
+            mean_entropy = neg_entropy.mean(-1)
+
+            #  store the sum across all the layers
+            samples_entropy.append(mean_entropy.sum(0))
+
+        # average over the batch
+        final_entropy = torch.stack(samples_entropy).mean()
+        if return_values:
+            return final_entropy, neg_entropies
+        else:
+            return final_entropy

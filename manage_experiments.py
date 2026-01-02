@@ -98,7 +98,6 @@ def show_experiment(args):
     print(f"  Learning Rate: {config['learning_rate']}")
     print(f"  Batch Size: {config['batch_size']}")
     print(f"  Epochs: {config['num_epochs']}")
-    print(f"  Multi-layer Loss: {config['use_multi_layer_loss']}")
     print()
 
     if metrics:
@@ -140,7 +139,7 @@ def compare_experiments(args):
 
     # Configuration comparison
     print("\nConfigurations:")
-    headers = ["Experiment", "Model", "LR", "BS", "Epochs", "Multi-Layer"]
+    headers = ["Experiment", "Model", "LR", "BS", "Epochs"]
     rows = []
     for exp in comparison["experiments"]:
         config = exp["config"]
@@ -151,7 +150,6 @@ def compare_experiments(args):
                 config.get("learning_rate", "N/A"),
                 config.get("batch_size", "N/A"),
                 config.get("num_epochs", "N/A"),
-                "Yes" if config.get("use_multi_layer_loss") else "No",
             ]
         )
     print(tabulate(rows, headers=headers, tablefmt="grid"))
