@@ -5,7 +5,7 @@ from typing import Optional
 @dataclass
 class TrainingConfig:
     # Model Parameters
-    model_name: str = "distilbert-base-uncased"
+    model_name: str = "bert-base-uncased"
     num_labels: int = 2
     classification_mode: str = (
         "binary"  # "binary" or "multiclass" (3-way: normal, hatespeech, offensive)
@@ -22,22 +22,20 @@ class TrainingConfig:
     early_stopping_patience: int = (
         2  # Stop if no improvement for N epochs (0 = disabled)
     )
+    hidden_dropout_prob: float = 0.1
+    
+    # Attention Mechanism Parameters
     train_attention: bool = False
     lambda_attn: float = 0.1
     ranking_margin: float = 0.1  # Minimum margin between token pairs
     ranking_threshold: float = 0.05  # Min difference to consider pairs significant
-    use_multi_layer_loss: bool = False
-    lower_loss_weight: float = 0.5  # Weight for auxiliary loss from debias layer
-    upper_loss_weight: float = 0.5  # Weight for main classification loss
-    hidden_dropout_prob: float = 0
-    debias_layer: int = 2  # Layer index for debiasing (0-indexed)
-    
+
     # EAR
     attn_regularization: Optional[bool] = False
     alpha_non_rationale: Optional[float] = 0.2
     beta_rationale: Optional[float] = 0.4
-    entropy_lower_bound: Optional[float] = 1.0
-    entropy_upper_bound: Optional[float] = 5.0
+    entropy_lower_bound: Optional[float] = 0.15
+    entropy_upper_bound: Optional[float] = 0.6
 
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)

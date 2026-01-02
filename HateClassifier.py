@@ -680,9 +680,11 @@ class HateClassifier:
                     if rationale_mask.any():
                         r_entropy = entropy[rationale_mask]
 
+                        # If the entropy is below lower bound then add loss
                         lower_violation = torch.relu(
                             self.entropy_lower_bound - r_entropy
                         )
+                        # If the entropy is above upper bound then add loss
                         upper_violation = torch.relu(
                             r_entropy - self.entropy_upper_bound
                         )
@@ -696,7 +698,7 @@ class HateClassifier:
                     if non_rationale_mask.any():
                         nr_entropy = entropy[non_rationale_mask]
 
-                        # maximize entropy → minimize negative entropy
+                        # Classic EAR: maximize entropy → minimize negative entropy
                         non_rationale_loss = -nr_entropy.mean()
                         non_rationale_losses.append(non_rationale_loss)
 
@@ -839,17 +841,17 @@ class HateClassifier:
 
             # p log p
             neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
-            entropy = -neg_entropy                 # [L, V]
+            # entropy = -neg_entropy                 # [L, V]
 
-            # average across layers
-            entropy = entropy.mean(0)              # [V]
+            # # average across layers
+            # entropy = entropy.mean(0)              # [V]
 
-            # normalize
-            max_entropy = torch.log(
-                torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
-            )
-            entropy = entropy / max_entropy
+            # # normalize
+            # max_entropy = torch.log(
+            #     torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
+            # )
+            # entropy = entropy / max_entropy
 
-            token_entropies.append(entropy)
+            token_entropies.append(neg_entropy)
 
         return token_entropies
