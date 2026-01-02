@@ -221,9 +221,9 @@ class HateClassifier:
             # Update progress bar with relevant loss components
             postfix = {"total": total_loss / num_batches}
             postfix["cls"] = total_cls_loss / num_batches
-            if self.train_attention and total_attn_loss > 0:
+            if self.train_attention:
                 postfix["attn"] = total_attn_loss / num_batches
-            if self.attn_regularization and total_ear_loss > 0:
+            if self.attn_regularization:
                 postfix["ear"] = total_ear_loss / num_batches
 
             progress_bar.set_postfix(postfix)
