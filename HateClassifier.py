@@ -19,7 +19,7 @@ from pathlib import Path
 
 class HateClassifier:
     """
-    HateDeRC: Hate Speech Detection with Debiasing Residual Connections.
+    HAXE: Hate Speech Detection with Debiasing Residual Connections.
 
     This classifier implements a novel architecture for binary hate speech detection
     that reduces dependency on target-sensitive words (e.g., race, religion, gender).
@@ -260,7 +260,7 @@ class HateClassifier:
 
     def train(self, train_dataloader, val_dataloader):
         """
-        Train the HateDeRC model with multi-component loss.
+        Train the HAXE model with multi-component loss.
         
         Training Configuration:
         - Attention supervision: Ranking-based loss from human annotations
