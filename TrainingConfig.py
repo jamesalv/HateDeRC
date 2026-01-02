@@ -31,6 +31,13 @@ class TrainingConfig:
     upper_loss_weight: float = 0.5  # Weight for main classification loss
     hidden_dropout_prob: float = 0
     debias_layer: int = 2  # Layer index for debiasing (0-indexed)
+    
+    # EAR
+    attn_regularization: Optional[bool] = False
+    alpha_non_rationale: Optional[float] = 0.2
+    beta_rationale: Optional[float] = 0.4
+    entropy_lower_bound: Optional[float] = 1.0
+    entropy_upper_bound: Optional[float] = 5.0
 
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)
