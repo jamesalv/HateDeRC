@@ -1,3 +1,4 @@
+from typing import Tuple
 import torch
 from torch.nn import CrossEntropyLoss
 import torch.nn as nn
@@ -60,18 +61,30 @@ class HateClassifier:
             config.model_name, config=model_config
         )
 
+        # Attention Training Configuration
+        self.train_attention = getattr(config, "train_attention", False)
+        # Attention training have to be true for these following parameters to be used
         self.lambda_attn = getattr(
             config, "lambda_attn", 0.1
         )  # λ: attention loss weight
-
-        # Attention Training Configuration
-        self.train_attention = getattr(config, "train_attention", False)
         self.ranking_margin = getattr(
             config, "ranking_margin", 0.1
         )  # Margin for pairwise ranking
         self.ranking_threshold = getattr(
             config, "ranking_threshold", 0.05
         )  # Threshold for significant pairs
+
+        # EAR (Entropy-based Attention Regularization)
+        self.attn_regularization = getattr(config, "attn_regularization", False)
+        self.alpha_non_rationale = getattr(
+            config, "alpha_non_rationale", 0.1
+        )  # Weight for non-rationale entropy
+        self.beta_rationale = getattr(
+            config, "beta_rationale", 0.1
+        )  # Weight for rationale entropy
+        # Anti-collapse parameters
+        self.entropy_lower_bound = getattr(config, "entropy_lower_bound", 1.0)
+        self.entropy_upper_bound = getattr(config, "entropy_upper_bound", 5.0)
 
         # Move model to device
         self.model.to(self.device)
@@ -131,6 +144,7 @@ class HateClassifier:
         total_loss = 0
         total_cls_loss = 0
         total_attn_loss = 0
+        total_ear_loss = 0
         num_batches = 0
 
         progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
@@ -168,6 +182,8 @@ class HateClassifier:
                 total_cls_loss += loss_dict["cls_loss"]
                 if "attn_loss" in loss_dict:
                     total_attn_loss += loss_dict["attn_loss"]
+                if "ear_loss" in loss_dict:
+                    total_ear_loss += loss_dict["ear_loss"]
 
                 # Scale loss for gradient accumulation
                 loss = loss / self.gradient_accumulation_steps
@@ -207,6 +223,8 @@ class HateClassifier:
             postfix["cls"] = total_cls_loss / num_batches
             if self.train_attention and total_attn_loss > 0:
                 postfix["attn"] = total_attn_loss / num_batches
+            if self.attn_regularization and total_ear_loss > 0:
+                postfix["ear"] = total_ear_loss / num_batches
 
             progress_bar.set_postfix(postfix)
 
@@ -295,6 +313,15 @@ class HateClassifier:
             print(
                 f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}"
             )
+        print(
+            " EAR (Entropy-based Attention Regularization): ", self.attn_regularization
+        )
+        if self.attn_regularization:
+            print(f"    - Rationale entropy weight (β): {self.beta_rationale}")
+            print(f"    - Non-rationale entropy weight (α): {self.alpha_non_rationale}")
+            print(
+                f"    - Entropy bounds: [{self.entropy_lower_bound}, {self.entropy_upper_bound}]"
+            )
         print("=" * 60)
 
         best_f1 = 0.0
@@ -331,12 +358,21 @@ class HateClassifier:
                 print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
             else:
                 patience_counter += 1
-                print(f"  No improvement (patience: {patience_counter}/{early_stopping_patience})")
-                
+                print(
+                    f"  No improvement (patience: {patience_counter}/{early_stopping_patience})"
+                )
+
                 # Early stopping check
-                if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
-                    print(f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs.")
-                    print(f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})")
+                if (
+                    early_stopping_patience > 0
+                    and patience_counter >= early_stopping_patience
+                ):
+                    print(
+                        f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs."
+                    )
+                    print(
+                        f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})"
+                    )
                     break
 
         self.save_history()
@@ -573,6 +609,7 @@ class HateClassifier:
         This method computes the total loss as a combination of:
         1. Classification loss (cross-entropy)
         2. Attention ranking loss (if attention supervision enabled)
+        3. Entropy-based attention regularization (if enabled)
 
         Args:
             logits: Logits from classifier (batch_size, num_labels)
@@ -589,31 +626,141 @@ class HateClassifier:
         """
         loss_dict = {}
 
-        # Classification loss
+        # 1. Classification loss
         cls_loss = self.cls_criterion(logits, labels)
         loss_dict["cls_loss"] = cls_loss.item()
         total_loss = cls_loss
 
-        # Attention Ranking Loss
+        # 2. Attention Ranking Loss
         if (
             self.train_attention
             and attentions is not None
             and human_rationales is not None
         ):
-            if len(attentions) > 0:
-                # Extract model attention from last layer
-                model_attention = self.extract_attention(attentions, return_tensor=True)
+            model_attention = self.extract_attention(attentions, return_tensor=True)
+            human_rationales = human_rationales.to(self.device, non_blocking=True)
 
-                # Move rationales to device
-                human_rationales = human_rationales.to(self.device, non_blocking=True)
+            # Calculate ranking loss
+            attn_loss = self.calculate_attention_loss(
+                human_rationales, model_attention, attention_mask
+            )
+            total_loss = total_loss + attn_loss
+            loss_dict["attn_loss"] = (
+                attn_loss.item() if isinstance(attn_loss, torch.Tensor) else attn_loss
+            )
 
-                # Calculate ranking loss (already weighted by lambda_attn internally)
-                attn_loss = self.calculate_attention_loss(
-                    human_rationales, model_attention, attention_mask
+            # ═══════════════════════════════════════════════════════════════
+            # 3. EAR: Entropy-based Attention Regularization
+            # ═══════════════════════════════════════════════════════════════
+            if self.attn_regularization:
+                # ───────────────────────────────────────────────────────────
+                # FIXED: Get per-token negative entropy
+                # ───────────────────────────────────────────────────────────
+                _, per_token_neg_entropies = self.compute_negative_entropy(
+                    attentions, attention_mask, return_values=True
+                )
+                # per_token_neg_entropies is a list of length batch_size
+                # Each element: [Layers, num_valid_tokens]
+
+                # ───────────────────────────────────────────────────────────
+                # Process each sample in batch
+                # ───────────────────────────────────────────────────────────
+                rationale_entropy_losses = []
+                non_rationale_entropy_losses = []
+
+                batch_size = human_rationales.shape[0]
+
+                for b in range(batch_size):
+                    # Get valid mask for this sample
+                    valid_mask = attention_mask[b].bool()
+                    valid_indices = torch.where(valid_mask)[0]
+
+                    if len(valid_indices) == 0:
+                        continue
+
+                    # Get per-token negative entropy for this sample
+                    # Average across layers: [Layers, num_valid] -> [num_valid]
+                    token_neg_entropy = per_token_neg_entropies[b].mean(0)
+                    # Shape: [num_valid_tokens]
+
+                    # Get rationale scores for valid tokens
+                    sample_rationales = human_rationales[b, valid_indices]
+                    # Shape: [num_valid_tokens]
+
+                    # ───────────────────────────────────────────────────────
+                    # Separate rationale vs non-rationale tokens
+                    # ───────────────────────────────────────────────────────
+                    is_rationale = (sample_rationales > 0).float()
+                    is_non_rationale = (sample_rationales == 0).float()
+
+                    # ───────────────────────────────────────────────────────
+                    # Rationale tokens: bounded entropy
+                    # ───────────────────────────────────────────────────────
+                    if is_rationale.sum() > 0:
+                        # Convert negative entropy to positive entropy
+                        rationale_entropy = -token_neg_entropy * is_rationale
+                        # Average only over rationale tokens
+                        avg_rationale_entropy = (
+                            rationale_entropy.sum() / is_rationale.sum()
+                        )
+
+                        # Apply bounds: penalize if outside [lower, upper]
+                        lower_bound_violation = torch.relu(
+                            self.entropy_lower_bound - avg_rationale_entropy
+                        )
+                        upper_bound_violation = torch.relu(
+                            avg_rationale_entropy - self.entropy_upper_bound
+                        )
+
+                        rationale_loss = lower_bound_violation + upper_bound_violation
+                        rationale_entropy_losses.append(rationale_loss)
+
+                    # ───────────────────────────────────────────────────────
+                    # Non-rationale tokens: maximize entropy (standard EAR)
+                    # ───────────────────────────────────────────────────────
+                    if is_non_rationale.sum() > 0:
+                        # Negative entropy for non-rationales (for maximization)
+                        non_rationale_neg_entropy = token_neg_entropy * is_non_rationale
+                        # Average only over non-rationale tokens
+                        avg_non_rationale_neg_entropy = (
+                            non_rationale_neg_entropy.sum() / is_non_rationale.sum()
+                        )
+                        non_rationale_entropy_losses.append(
+                            avg_non_rationale_neg_entropy
+                        )
+
+                # ───────────────────────────────────────────────────────────
+                # Aggregate losses across batch
+                # ───────────────────────────────────────────────────────────
+                if len(rationale_entropy_losses) > 0:
+                    rationale_entropy_loss = torch.stack(
+                        rationale_entropy_losses
+                    ).mean()
+                else:
+                    rationale_entropy_loss = torch.tensor(0.0, device=self.device)
+
+                if len(non_rationale_entropy_losses) > 0:
+                    non_rationale_entropy_loss = torch.stack(
+                        non_rationale_entropy_losses
+                    ).mean()
+                else:
+                    non_rationale_entropy_loss = torch.tensor(0.0, device=self.device)
+
+                # ───────────────────────────────────────────────────────────
+                # Final EAR loss
+                # ───────────────────────────────────────────────────────────
+                ear_loss = (
+                    self.beta_rationale * rationale_entropy_loss  # Anti-collapse
+                    + self.alpha_non_rationale
+                    * non_rationale_entropy_loss  # Standard EAR
                 )
 
-                total_loss = total_loss + attn_loss
-                loss_dict["attn_loss"] = attn_loss.item()
+                total_loss = total_loss + ear_loss
+                loss_dict["ear_loss"] = ear_loss.item()
+                loss_dict["rationale_entropy_loss"] = rationale_entropy_loss.item()
+                loss_dict["non_rationale_entropy_loss"] = (
+                    non_rationale_entropy_loss.item()
+                )
 
         loss_dict["total_loss"] = total_loss
         return loss_dict
@@ -699,3 +846,51 @@ class HateClassifier:
 
         avg_loss = total_loss / total_pairs
         return self.lambda_attn * avg_loss
+
+    def compute_negative_entropy(
+        self, inputs: Tuple, attention_mask: torch.Tensor, return_values=False
+    ):
+        """
+        Compute the negative entropy across layers of a network for given inputs.
+
+        Args:
+            - input: tuple. Tuple of length num_layers. Each item should be in the form: BHSS
+            - attention_mask. Tensor with dim: BS
+
+        Code adapted from:
+            Attanasio, G., Nozza, D., Hovy, D., & Baralis, E.
+            "Entropy-based Attention Regularization Frees Unintended Bias Mitigation from Lists".
+            In Findings of the Association for Computational Linguistics: ACL2022.
+            Association for Computational Linguistics, 2022.
+        """
+        inputs_stacked = torch.stack(inputs)  #  LayersBatchHeadsSeqlenSeqlen
+        assert inputs_stacked.ndim == 5, "Here we expect 5 dimensions in the form LBHSS"
+
+        #  average over attention heads
+        pool_heads = inputs_stacked.mean(2)
+        batch_size = pool_heads.shape[1]
+        samples_entropy = list()
+        neg_entropies = list()
+        for b in range(batch_size):
+            #  get inputs from non-padded tokens of the current sample
+            mask = attention_mask[b]
+            sample = pool_heads[:, b, mask.bool(), :]
+            sample = sample[:, :, mask.bool()]
+
+            #  get the negative entropy for each non-padded token
+            neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
+            if return_values:
+                neg_entropies.append(neg_entropy.detach())
+
+            #  get the "average entropy" that traverses the layer
+            mean_entropy = neg_entropy.mean(-1)
+
+            #  store the sum across all the layers
+            samples_entropy.append(mean_entropy.sum(0))
+
+        # average over the batch
+        final_entropy = torch.stack(samples_entropy).mean()
+        if return_values:
+            return final_entropy, neg_entropies
+        else:
+            return final_entropy
