@@ -19,6 +19,9 @@ class TrainingConfig:
     learning_rate: float = 1e-5
     batch_size: int = 32
     num_epochs: int = 2
+    early_stopping_patience: int = (
+        2  # Stop if no improvement for N epochs (0 = disabled)
+    )
     train_attention: bool = False
     lambda_attn: float = 0.1
     ranking_margin: float = 0.1  # Minimum margin between token pairs

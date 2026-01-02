@@ -298,6 +298,8 @@ class HateClassifier:
         print("=" * 60)
 
         best_f1 = 0.0
+        patience_counter = 0
+        early_stopping_patience = getattr(self.config, "early_stopping_patience", 0)
 
         for epoch in range(self.config.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
@@ -324,13 +326,25 @@ class HateClassifier:
             # Save best model
             if val_f1 > best_f1:
                 best_f1 = val_f1
+                patience_counter = 0  # Reset patience counter
                 self.save_model("best_model")
                 print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
+            else:
+                patience_counter += 1
+                print(f"  No improvement (patience: {patience_counter}/{early_stopping_patience})")
+                
+                # Early stopping check
+                if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                    print(f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs.")
+                    print(f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})")
+                    break
 
         self.save_history()
 
         print("\n" + "=" * 60)
         print(f"Training completed!")
+        if patience_counter >= early_stopping_patience and early_stopping_patience > 0:
+            print(f"Stopped early at epoch {epoch + 1}/{self.config.num_epochs}")
         print(f"Best F1 Score: {best_f1:.4f}")
         print(
             f"Training history saved to: {self.config.save_dir}/training_history.json"
