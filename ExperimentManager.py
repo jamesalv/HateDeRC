@@ -148,7 +148,7 @@ class ExperimentManager:
             "batch_size": config.batch_size,
             "num_epochs": config.num_epochs,
             "train_attention": config.train_attention,
-            "use_multi_layer_loss": config.use_multi_layer_loss,
+            "attn_regularization": config.attn_regularization,
             "hidden_dropout_prob": config.hidden_dropout_prob,
             # Optimization Parameters
             "use_amp": config.use_amp,
