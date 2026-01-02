@@ -816,15 +816,12 @@ class HateClassifier:
     ):
         """
         Compute normalized per-token attention entropy.
-
-        Returns:
-            List[Tensor]: length = batch_size
-            Each tensor shape: [num_valid_tokens]
-            Values normalized to [0, 1]
+        
+        CORRECTED: Uses raw attention probabilities instead of re-softmaxing.
         """
         # attentions: tuple(L) of (B, H, S, S)
         stacked = torch.stack(attentions)  # [L, B, H, S, S]
-        pooled = stacked.mean(2)           # [L, B, S, S]
+        pooled = stacked.mean(2)           # [L, B, S, S] (Average over heads)
 
         batch_size = pooled.shape[1]
         token_entropies = []
@@ -837,22 +834,33 @@ class HateClassifier:
                 token_entropies.append(None)
                 continue
 
-            # [L, V, V]
+            # [L, V, V] - Extract attention sub-matrix for valid tokens
             sample = pooled[:, b, mask, :][:, :, mask]
 
-            # p log p
-            neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
+            # -------------------------------------------------------
+            # FIX: Do not use softmax() here. 
+            # 'sample' is already probabilities from the model.
+            # H(p) = - sum(p * log(p))
+            # -------------------------------------------------------
+            epsilon = 1e-9
+            # clamp to ensure numerical stability (optional but good practice)
+            sample = torch.clamp(sample, min=epsilon, max=1.0)
+            
+            neg_entropy = (sample * torch.log(sample)).sum(-1)
             entropy = -neg_entropy                 # [L, V]
 
             # average across layers
             entropy = entropy.mean(0)              # [V]
 
-            # normalize
+            # normalize by max possible entropy for this sequence length
             max_entropy = torch.log(
                 torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
             )
-            entropy = entropy / max_entropy
-
+            
+            # Avoid division by zero if num_valid is 1 (handled above, but safe guard)
+            if max_entropy > 0:
+                entropy = entropy / max_entropy
+            
             token_entropies.append(entropy)
 
         return token_entropies
