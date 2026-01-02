@@ -83,8 +83,9 @@ class HateClassifier:
             config, "beta_rationale", 0.1
         )  # Weight for rationale entropy
         # Anti-collapse parameters
-        self.entropy_lower_bound = getattr(config, "entropy_lower_bound", 1.0)
-        self.entropy_upper_bound = getattr(config, "entropy_upper_bound", 5.0)
+        # Normalized entropy bounds [0, 1]
+        self.entropy_lower_bound = getattr(config, "entropy_lower_bound", 0.15)
+        self.entropy_upper_bound = getattr(config, "entropy_upper_bound", 0.6)
 
         # Move model to device
         self.model.to(self.device)
@@ -649,118 +650,76 @@ class HateClassifier:
                 attn_loss.item() if isinstance(attn_loss, torch.Tensor) else attn_loss
             )
 
-            # ═══════════════════════════════════════════════════════════════
-            # 3. EAR: Entropy-based Attention Regularization
-            # ═══════════════════════════════════════════════════════════════
+            # ───────────────────────────────────────────────────────────
+            # 3. EAR: Rationale-aware entropy regularization
+            # ───────────────────────────────────────────────────────────
             if self.attn_regularization:
-                # ───────────────────────────────────────────────────────────
-                # FIXED: Get per-token negative entropy
-                # ───────────────────────────────────────────────────────────
-                _, per_token_neg_entropies = self.compute_negative_entropy(
-                    attentions, attention_mask, return_values=True
-                )
-                # per_token_neg_entropies is a list of length batch_size
-                # Each element: [Layers, num_valid_tokens]
 
-                # ───────────────────────────────────────────────────────────
-                # Process each sample in batch
-                # ───────────────────────────────────────────────────────────
-                rationale_entropy_losses = []
-                non_rationale_entropy_losses = []
+                token_entropies = self.compute_token_entropy(attentions, attention_mask)
 
-                batch_size = human_rationales.shape[0]
-
+                rationale_losses = []
+                non_rationale_losses = []
+                batch_size = logits.size(0)
+                
                 for b in range(batch_size):
-                    # Get valid mask for this sample
+                    entropy = token_entropies[b]
+                    if entropy is None:
+                        continue
+
                     valid_mask = attention_mask[b].bool()
                     valid_indices = torch.where(valid_mask)[0]
 
-                    if len(valid_indices) == 0:
-                        continue
+                    human = human_rationales[b, valid_indices]
 
-                    # Get per-token negative entropy for this sample
-                    # Average across layers: [Layers, num_valid] -> [num_valid]
-                    token_neg_entropy = per_token_neg_entropies[b].mean(0)
-                    # Shape: [num_valid_tokens]
+                    rationale_mask = (human > 0)
+                    non_rationale_mask = (human == 0)
 
-                    # Get rationale scores for valid tokens
-                    sample_rationales = human_rationales[b, valid_indices]
-                    # Shape: [num_valid_tokens]
+                    # ────────────────
+                    # RATIONALE TOKENS
+                    # ────────────────
+                    if rationale_mask.any():
+                        r_entropy = entropy[rationale_mask]
 
-                    # ───────────────────────────────────────────────────────
-                    # Separate rationale vs non-rationale tokens
-                    # ───────────────────────────────────────────────────────
-                    is_rationale = (sample_rationales > 0).float()
-                    is_non_rationale = (sample_rationales == 0).float()
-
-                    # ───────────────────────────────────────────────────────
-                    # Rationale tokens: bounded entropy
-                    # ───────────────────────────────────────────────────────
-                    if is_rationale.sum() > 0:
-                        # Convert negative entropy to positive entropy
-                        rationale_entropy = -token_neg_entropy * is_rationale
-                        # Average only over rationale tokens
-                        avg_rationale_entropy = (
-                            rationale_entropy.sum() / is_rationale.sum()
+                        lower_violation = torch.relu(
+                            self.entropy_lower_bound - r_entropy
+                        )
+                        upper_violation = torch.relu(
+                            r_entropy - self.entropy_upper_bound
                         )
 
-                        # Apply bounds: penalize if outside [lower, upper]
-                        lower_bound_violation = torch.relu(
-                            self.entropy_lower_bound - avg_rationale_entropy
-                        )
-                        upper_bound_violation = torch.relu(
-                            avg_rationale_entropy - self.entropy_upper_bound
-                        )
+                        rationale_loss = (lower_violation + upper_violation).mean()
+                        rationale_losses.append(rationale_loss)
 
-                        rationale_loss = lower_bound_violation + upper_bound_violation
-                        rationale_entropy_losses.append(rationale_loss)
+                    # ─────────────────────
+                    # NON-RATIONALE TOKENS
+                    # ─────────────────────
+                    if non_rationale_mask.any():
+                        nr_entropy = entropy[non_rationale_mask]
 
-                    # ───────────────────────────────────────────────────────
-                    # Non-rationale tokens: maximize entropy (standard EAR)
-                    # ───────────────────────────────────────────────────────
-                    if is_non_rationale.sum() > 0:
-                        # Negative entropy for non-rationales (for maximization)
-                        non_rationale_neg_entropy = token_neg_entropy * is_non_rationale
-                        # Average only over non-rationale tokens
-                        avg_non_rationale_neg_entropy = (
-                            non_rationale_neg_entropy.sum() / is_non_rationale.sum()
-                        )
-                        non_rationale_entropy_losses.append(
-                            avg_non_rationale_neg_entropy
-                        )
+                        # maximize entropy → minimize negative entropy
+                        non_rationale_loss = -nr_entropy.mean()
+                        non_rationale_losses.append(non_rationale_loss)
 
-                # ───────────────────────────────────────────────────────────
-                # Aggregate losses across batch
-                # ───────────────────────────────────────────────────────────
-                if len(rationale_entropy_losses) > 0:
-                    rationale_entropy_loss = torch.stack(
-                        rationale_entropy_losses
-                    ).mean()
+                if rationale_losses:
+                    rationale_entropy_loss = torch.stack(rationale_losses).mean()
                 else:
                     rationale_entropy_loss = torch.tensor(0.0, device=self.device)
 
-                if len(non_rationale_entropy_losses) > 0:
-                    non_rationale_entropy_loss = torch.stack(
-                        non_rationale_entropy_losses
-                    ).mean()
+                if non_rationale_losses:
+                    non_rationale_entropy_loss = torch.stack(non_rationale_losses).mean()
                 else:
                     non_rationale_entropy_loss = torch.tensor(0.0, device=self.device)
 
-                # ───────────────────────────────────────────────────────────
-                # Final EAR loss
-                # ───────────────────────────────────────────────────────────
                 ear_loss = (
-                    self.beta_rationale * rationale_entropy_loss  # Anti-collapse
-                    + self.alpha_non_rationale
-                    * non_rationale_entropy_loss  # Standard EAR
+                    self.beta_rationale * rationale_entropy_loss
+                    + self.alpha_non_rationale * non_rationale_entropy_loss
                 )
 
                 total_loss = total_loss + ear_loss
+
                 loss_dict["ear_loss"] = ear_loss.item()
                 loss_dict["rationale_entropy_loss"] = rationale_entropy_loss.item()
-                loss_dict["non_rationale_entropy_loss"] = (
-                    non_rationale_entropy_loss.item()
-                )
+                loss_dict["non_rationale_entropy_loss"] = non_rationale_entropy_loss.item()
 
         loss_dict["total_loss"] = total_loss
         return loss_dict
@@ -847,50 +806,50 @@ class HateClassifier:
         avg_loss = total_loss / total_pairs
         return self.lambda_attn * avg_loss
 
-    def compute_negative_entropy(
-        self, inputs: Tuple, attention_mask: torch.Tensor, return_values=False
+    def compute_token_entropy(
+        self,
+        attentions: Tuple[torch.Tensor],
+        attention_mask: torch.Tensor,
     ):
         """
-        Compute the negative entropy across layers of a network for given inputs.
+        Compute normalized per-token attention entropy.
 
-        Args:
-            - input: tuple. Tuple of length num_layers. Each item should be in the form: BHSS
-            - attention_mask. Tensor with dim: BS
-
-        Code adapted from:
-            Attanasio, G., Nozza, D., Hovy, D., & Baralis, E.
-            "Entropy-based Attention Regularization Frees Unintended Bias Mitigation from Lists".
-            In Findings of the Association for Computational Linguistics: ACL2022.
-            Association for Computational Linguistics, 2022.
+        Returns:
+            List[Tensor]: length = batch_size
+            Each tensor shape: [num_valid_tokens]
+            Values normalized to [0, 1]
         """
-        inputs_stacked = torch.stack(inputs)  #  LayersBatchHeadsSeqlenSeqlen
-        assert inputs_stacked.ndim == 5, "Here we expect 5 dimensions in the form LBHSS"
+        # attentions: tuple(L) of (B, H, S, S)
+        stacked = torch.stack(attentions)  # [L, B, H, S, S]
+        pooled = stacked.mean(2)           # [L, B, S, S]
 
-        #  average over attention heads
-        pool_heads = inputs_stacked.mean(2)
-        batch_size = pool_heads.shape[1]
-        samples_entropy = list()
-        neg_entropies = list()
+        batch_size = pooled.shape[1]
+        token_entropies = []
+
         for b in range(batch_size):
-            #  get inputs from non-padded tokens of the current sample
-            mask = attention_mask[b]
-            sample = pool_heads[:, b, mask.bool(), :]
-            sample = sample[:, :, mask.bool()]
+            mask = attention_mask[b].bool()
+            num_valid = mask.sum().item()
 
-            #  get the negative entropy for each non-padded token
+            if num_valid <= 1:
+                token_entropies.append(None)
+                continue
+
+            # [L, V, V]
+            sample = pooled[:, b, mask, :][:, :, mask]
+
+            # p log p
             neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
-            if return_values:
-                neg_entropies.append(neg_entropy.detach())
+            entropy = -neg_entropy                 # [L, V]
 
-            #  get the "average entropy" that traverses the layer
-            mean_entropy = neg_entropy.mean(-1)
+            # average across layers
+            entropy = entropy.mean(0)              # [V]
 
-            #  store the sum across all the layers
-            samples_entropy.append(mean_entropy.sum(0))
+            # normalize
+            max_entropy = torch.log(
+                torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
+            )
+            entropy = entropy / max_entropy
 
-        # average over the batch
-        final_entropy = torch.stack(samples_entropy).mean()
-        if return_values:
-            return final_entropy, neg_entropies
-        else:
-            return final_entropy
+            token_entropies.append(entropy)
+
+        return token_entropies
