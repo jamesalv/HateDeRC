@@ -841,16 +841,16 @@ class HateClassifier:
 
             # p log p
             neg_entropy = (sample.softmax(-1) * sample.log_softmax(-1)).sum(-1)
-            # entropy = -neg_entropy                 # [L, V]
+            entropy = -neg_entropy                 # [L, V]
 
-            # # average across layers
-            # entropy = entropy.mean(0)              # [V]
+            # average across layers
+            entropy = entropy.mean(0)              # [V]
 
-            # # normalize
-            # max_entropy = torch.log(
-            #     torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
-            # )
-            # entropy = entropy / max_entropy
+            # normalize
+            max_entropy = torch.log(
+                torch.tensor(num_valid, device=entropy.device, dtype=entropy.dtype)
+            )
+            entropy = entropy / max_entropy
 
             token_entropies.append(neg_entropy)
 
