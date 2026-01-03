@@ -147,7 +147,18 @@ class ExperimentManager:
             "batch_size": config.batch_size,
             "num_epochs": config.num_epochs,
             "train_attention": config.train_attention,
+            "lambda_attn": config.lambda_attn,
+            "ranking_margin": config.ranking_margin,
+            "ranking_threshold": config.ranking_threshold,
+            "train_entropy": config.train_entropy,
+            "alpha_entropy": config.alpha_entropy,
             "hidden_dropout_prob": config.hidden_dropout_prob,
+            # Multi-Stage Training Parameters
+            "use_multistage_training": config.use_multistage_training,
+            "entropy_only_epochs": config.entropy_only_epochs,
+            "attention_alignment_epochs": config.attention_alignment_epochs,
+            "model_rationale_topk": config.model_rationale_topk,
+            "model_rationale_threshold": config.model_rationale_threshold,
             # Optimization Parameters
             "use_amp": config.use_amp,
             "gradient_accumulation_steps": config.gradient_accumulation_steps,

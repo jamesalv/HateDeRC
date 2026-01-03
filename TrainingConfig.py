@@ -23,7 +23,7 @@ class TrainingConfig:
         2  # Stop if no improvement for N epochs (0 = disabled)
     )
     hidden_dropout_prob: float = 0.1
-    
+
     # Attention-based Ranking Loss Parameters
     train_attention: bool = False
     lambda_attn: float = 0.1
@@ -33,7 +33,14 @@ class TrainingConfig:
     # Entropy Regularization Parameters
     train_entropy: bool = False
     alpha_entropy: float = 0.01  # Weight for entropy loss component
-    
+
+    # Multi-Stage Training Parameters
+    use_multistage_training: bool = False  # Enable exploration → discovery → alignment
+    entropy_only_epochs: int = 3  # Stage 1: Entropy exploration epochs
+    attention_alignment_epochs: int = 2  # Stage 2: Attention alignment epochs
+    model_rationale_topk: int = 5  # Top-k model-discovered tokens to extract
+    model_rationale_threshold: float = 0.4  # Scale factor for model rationales (0-1)
+
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)
     gradient_accumulation_steps: int = (

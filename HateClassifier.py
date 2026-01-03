@@ -80,6 +80,18 @@ class HateClassifier:
             config, "alpha_entropy", 0.01
         )  # α: entropy loss weight
 
+        # Multi-Stage Training Configuration
+        self.use_multistage_training = getattr(config, "use_multistage_training", False)
+        self.entropy_only_epochs = getattr(config, "entropy_only_epochs", 3)
+        self.attention_alignment_epochs = getattr(
+            config, "attention_alignment_epochs", 2
+        )
+        self.model_rationale_topk = getattr(config, "model_rationale_topk", 5)
+        self.model_rationale_threshold = getattr(
+            config, "model_rationale_threshold", 0.4
+        )
+        self.augmented_rationales = None  # Will store human + model rationales
+
         # Move model to device
         self.model.to(self.device)
 
@@ -125,14 +137,33 @@ class HateClassifier:
             "val_f1": [],
         }
 
-    def train_epoch(self, train_dataloader):
+    def train_epoch(self, train_dataloader, epoch=0):
         """
         Train for one epoch.
+
+        Args:
+            train_dataloader: DataLoader for training data
+            epoch: Current epoch number (for multi-stage training)
 
         Returns:
             float: Average total loss for the epoch
         """
         self.model.train()
+
+        # Determine which loss components to use based on multi-stage training
+        if self.use_multistage_training:
+            # Stage 1: Entropy only (first N epochs)
+            if epoch < self.entropy_only_epochs:
+                use_entropy_this_epoch = True
+                use_attention_this_epoch = False
+            # Stage 2: Attention alignment with augmented rationales
+            else:
+                use_entropy_this_epoch = False
+                use_attention_this_epoch = True
+        else:
+            # Normal training: use configured settings
+            use_entropy_this_epoch = self.train_entropy
+            use_attention_this_epoch = self.train_attention
 
         # Track individual loss components for monitoring
         total_loss = 0
@@ -153,11 +184,26 @@ class HateClassifier:
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_attentions=self.train_attention or self.train_entropy,
+                    output_attentions=use_attention_this_epoch
+                    or use_entropy_this_epoch,
                 )
 
                 # Get logits from model
                 logits = outputs.logits
+
+                # Get rationales (use augmented if available, otherwise original)
+                if use_attention_this_epoch:
+                    if self.augmented_rationales is not None:
+                        # Use augmented rationales (human + model)
+                        batch_indices = batch.get("batch_indices", None)
+                        if batch_indices is not None:
+                            rationales = self.augmented_rationales[batch_indices]
+                        else:
+                            rationales = batch.get("rationales")
+                    else:
+                        rationales = batch.get("rationales")
+                else:
+                    rationales = None
 
                 # Calculate loss
                 loss_dict = self._calculate_loss(
@@ -166,12 +212,12 @@ class HateClassifier:
                     attention_mask=attention_mask,
                     attentions=(
                         outputs.attentions
-                        if (self.train_attention or self.train_entropy)
+                        if (use_attention_this_epoch or use_entropy_this_epoch)
                         else None
                     ),
-                    human_rationales=(
-                        batch.get("rationales") if self.train_attention else None
-                    ),
+                    human_rationales=rationales,
+                    use_attention_loss=use_attention_this_epoch,
+                    use_entropy_loss=use_entropy_this_epoch,
                 )
 
                 loss = loss_dict["total_loss"]
@@ -219,9 +265,17 @@ class HateClassifier:
             # Update progress bar with relevant loss components
             postfix = {"total": total_loss / num_batches}
             postfix["cls"] = total_cls_loss / num_batches
-            if self.train_attention and total_attn_loss > 0:
+
+            # Show stage indicator for multi-stage training
+            if self.use_multistage_training:
+                if epoch < self.entropy_only_epochs:
+                    postfix["stage"] = "explore"
+                else:
+                    postfix["stage"] = "align"
+
+            if use_attention_this_epoch and total_attn_loss > 0:
                 postfix["attn"] = total_attn_loss / num_batches
-            if self.train_entropy and total_entropy_loss != 0:
+            if use_entropy_this_epoch and total_entropy_loss != 0:
                 postfix["entropy"] = total_entropy_loss / num_batches
 
             progress_bar.set_postfix(postfix)
@@ -305,15 +359,28 @@ class HateClassifier:
         print(f"Mixed precision (AMP): {self.use_amp}")
         print(f"Gradient clipping: {self.max_grad_norm}")
         print(f"\nLoss Configuration:")
-        print(f"  Attention supervision: {self.train_attention}")
-        if self.train_attention:
-            print(f"    - Ranking loss: λ={self.lambda_attn}")
+        if self.use_multistage_training:
+            print(f"  🔄 Multi-Stage Training ENABLED")
             print(
-                f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}"
+                f"    Stage 1 (Epochs 1-{self.entropy_only_epochs}): Entropy Exploration"
             )
-        print(f"  Entropy maximization: {self.train_entropy}")
-        if self.train_entropy:
-            print(f"    - Entropy loss: α={self.alpha_entropy}")
+            print(f"      - Spread attention across tokens (α={self.alpha_entropy})")
+            print(
+                f"    Stage 2 (Epochs {self.entropy_only_epochs + 1}-{self.entropy_only_epochs + self.attention_alignment_epochs}): Attention Alignment"
+            )
+            print(f"      - Extract top-{self.model_rationale_topk} model discoveries")
+            print(f"      - Augment with threshold={self.model_rationale_threshold}")
+            print(f"      - Align to human + model rationales (λ={self.lambda_attn})")
+        else:
+            print(f"  Attention supervision: {self.train_attention}")
+            if self.train_attention:
+                print(f"    - Ranking loss: λ={self.lambda_attn}")
+                print(
+                    f"    - Margin: {self.ranking_margin}, Threshold: {self.ranking_threshold}"
+                )
+            print(f"  Entropy maximization: {self.train_entropy}")
+            if self.train_entropy:
+                print(f"    - Entropy loss: α={self.alpha_entropy}")
         print("=" * 60)
 
         best_f1 = 0.0
@@ -323,8 +390,18 @@ class HateClassifier:
         for epoch in range(self.config.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
 
+            # Multi-stage training: extract model rationales after entropy exploration phase
+            if self.use_multistage_training and epoch == self.entropy_only_epochs:
+                print("\n" + "=" * 60)
+                print("🔍 STAGE TRANSITION: Entropy Exploration → Attention Alignment")
+                print("=" * 60)
+                print("Extracting model-discovered rationales...")
+                self.augment_rationales_with_model_discoveries(train_dataloader)
+                print("✓ Rationales augmented! Proceeding to alignment phase.")
+                print("=" * 60 + "\n")
+
             # Train for one epoch
-            train_loss = self.train_epoch(train_dataloader)
+            train_loss = self.train_epoch(train_dataloader, epoch=epoch)
 
             # Evaluate on validation set
             val_loss, val_accuracy, val_f1 = self.evaluate(val_dataloader)
@@ -594,6 +671,8 @@ class HateClassifier:
         attention_mask,
         attentions=None,
         human_rationales=None,
+        use_attention_loss=None,
+        use_entropy_loss=None,
     ):
         """
         Calculate unified loss with configurable component weights.
@@ -609,12 +688,15 @@ class HateClassifier:
             attention_mask: Attention mask for padding (batch_size, seq_len)
             attentions: Tuple of attention tensors from model (optional)
             human_rationales: Human token annotations (batch_size, seq_len) (optional)
+            use_attention_loss: Override for attention loss (for multi-stage training)
+            use_entropy_loss: Override for entropy loss (for multi-stage training)
 
         Returns:
             dict: Dictionary containing:
                 - 'total_loss': Sum of all loss components
                 - 'cls_loss': Classification loss
                 - 'attn_loss': Attention ranking loss (if attention training enabled)
+                - 'entropy_loss': Entropy loss (if entropy training enabled)
         """
         loss_dict = {}
 
@@ -623,9 +705,19 @@ class HateClassifier:
         loss_dict["cls_loss"] = cls_loss.item()
         total_loss = cls_loss
 
+        # Use explicit flags if provided, otherwise use instance settings
+        apply_attention_loss = (
+            use_attention_loss
+            if use_attention_loss is not None
+            else self.train_attention
+        )
+        apply_entropy_loss = (
+            use_entropy_loss if use_entropy_loss is not None else self.train_entropy
+        )
+
         # Attention Ranking Loss
         if (
-            self.train_attention
+            apply_attention_loss
             and attentions is not None
             and human_rationales is not None
         ):
@@ -645,7 +737,7 @@ class HateClassifier:
                 loss_dict["attn_loss"] = attn_loss.item()
 
         # Entropy Loss (maximize entropy = minimize negative entropy)
-        if self.train_entropy and attentions is not None:
+        if apply_entropy_loss and attentions is not None:
             if len(attentions) > 0:
                 # Compute negative entropy across layers
                 neg_entropy = self.compute_negative_entropy(attentions, attention_mask)
@@ -743,6 +835,130 @@ class HateClassifier:
         avg_loss = total_loss / total_pairs
         return self.lambda_attn * avg_loss
 
+    def augment_rationales_with_model_discoveries(self, train_dataloader):
+        """
+        Extract model's learned attention patterns and augment human rationales.
+
+        This method:
+        1. Runs inference on training data to get model attention weights
+        2. Identifies top-k tokens with high model attention but low human rationale
+        3. Normalizes and thresholds these model rationales
+        4. Combines them with human rationales to create augmented supervision
+
+        Args:
+            train_dataloader: DataLoader for training data
+        """
+        self.model.eval()
+
+        all_human_rationales = []
+        all_model_attentions = []
+        all_attention_masks = []
+
+        print(f"Extracting attention from {len(train_dataloader)} batches...")
+
+        with torch.no_grad():
+            for batch in tqdm(
+                train_dataloader, desc="Extracting attentions", unit="batch"
+            ):
+                input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(
+                    self.device, non_blocking=True
+                )
+                human_rationales = batch.get("rationales")
+
+                # Get model attention
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_attentions=True,
+                )
+
+                # Extract CLS attention from last layer
+                model_attention = self.extract_attention(
+                    outputs.attentions, return_tensor=True
+                )
+
+                # Store for processing
+                all_human_rationales.append(human_rationales.cpu())
+                all_model_attentions.append(model_attention.cpu())
+                all_attention_masks.append(attention_mask.cpu())
+
+        # Concatenate all batches
+        all_human_rationales = torch.cat(all_human_rationales, dim=0)  # (N, seq_len)
+        all_model_attentions = torch.cat(all_model_attentions, dim=0)  # (N, seq_len)
+        all_attention_masks = torch.cat(all_attention_masks, dim=0)  # (N, seq_len)
+
+        print(f"Processing {all_human_rationales.shape[0]} samples...")
+
+        # Create augmented rationales
+        augmented = torch.zeros_like(all_human_rationales)
+
+        for i in range(all_human_rationales.shape[0]):
+            human_rat = all_human_rationales[i]
+            model_att = all_model_attentions[i]
+            mask = all_attention_masks[i]
+
+            # Get valid positions (non-padding)
+            valid_positions = mask.bool()
+
+            # Find positions where model attention is high but human rationale is low
+            # (model discovered something humans didn't highlight)
+            human_threshold = 0.1  # Consider as "not highlighted" if < 0.1
+            model_discovered = (
+                (model_att > 0) & (human_rat < human_threshold) & valid_positions
+            )
+
+            # Get top-k model-discovered tokens
+            model_discovered_scores = model_att.clone()
+            model_discovered_scores[~model_discovered] = -1  # Mask out non-discovered
+
+            # Get top-k indices
+            topk_k = min(self.model_rationale_topk, model_discovered.sum().item())
+            if topk_k > 0:
+                topk_values, topk_indices = torch.topk(
+                    model_discovered_scores, k=topk_k
+                )
+
+                # Normalize top-k values to [0, 1]
+                if topk_values.max() > topk_values.min():
+                    normalized_values = (topk_values - topk_values.min()) / (
+                        topk_values.max() - topk_values.min()
+                    )
+                else:
+                    normalized_values = torch.ones_like(topk_values)
+
+                # Apply threshold to make model rationales complementary
+                model_rationales = normalized_values * self.model_rationale_threshold
+
+                # Start with human rationales
+                augmented[i] = human_rat.clone()
+
+                # Add model-discovered rationales (not replacing, adding)
+                augmented[i, topk_indices] = torch.maximum(
+                    augmented[i, topk_indices], model_rationales
+                )
+            else:
+                # No model discoveries, keep human rationales only
+                augmented[i] = human_rat.clone()
+
+        # Store augmented rationales
+        self.augmented_rationales = augmented
+
+        # Calculate statistics
+        original_highlighted = (all_human_rationales > 0).sum().item()
+        augmented_highlighted = (augmented > 0).sum().item()
+        added_tokens = augmented_highlighted - original_highlighted
+
+        print(f"\n📊 Augmentation Statistics:")
+        print(f"  Original human-highlighted tokens: {original_highlighted}")
+        print(f"  Augmented total highlighted tokens: {augmented_highlighted}")
+        print(f"  Model-discovered tokens added: {added_tokens}")
+        print(
+            f"  Average tokens added per sample: {added_tokens / all_human_rationales.shape[0]:.2f}"
+        )
+
+        self.model.train()
+
     def compute_negative_entropy(
         self, inputs: tuple, attention_mask: torch.Tensor, return_values=False
     ):
@@ -753,7 +969,7 @@ class HateClassifier:
             - attention_mask. Tensor with dim: BS
 
         Code adapted from:
-        Attanasio, G., Nozza, D., Hovy, D., & Baralis, E.
+        Attanasio, G., Nozza, D., Hovy, D., Baralis, E.
         "Entropy-based Attention Regularization Frees Unintended Bias Mitigation from Lists".
         In Findings of the Association for Computational Linguistics: ACL2022.
         Association for Computational Linguistics, 2022.
