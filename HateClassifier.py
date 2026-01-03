@@ -91,10 +91,6 @@ class HateClassifier:
             config, "model_rationale_threshold", 0.2  # Reduced from 0.4
         )
         self.augmented_rationales = None  # Will store human + model rationales
-        
-        # Stage-specific attention loss weights
-        self.lambda_attn_alignment = getattr(config, "lambda_attn_alignment", 0.01)  # Lighter for alignment
-        self.ranking_margin_alignment = getattr(config, "ranking_margin_alignment", 0.05)  # Softer margin
 
         # Move model to device
         self.model.to(self.device)
@@ -397,8 +393,6 @@ class HateClassifier:
                 f"    Stage 2 (Epochs {self.entropy_only_epochs + 1}-{self.entropy_only_epochs + self.attention_alignment_epochs}): Attention Alignment"
             )
             print(f"      - Extract top-{self.model_rationale_topk} model discoveries")
-            print(f"      - Augment with threshold={self.model_rationale_threshold}")
-            print(f"      - Align to human + model rationales (λ={self.lambda_attn_alignment})")
             print(f"      - Encoder FROZEN (only attention reshaping)")
         else:
             print(f"  Attention supervision: {self.train_attention}")
@@ -436,13 +430,6 @@ class HateClassifier:
                 # CRITICAL: Freeze encoder to prevent representation drift
                 print("\n🔒 Freezing encoder...")
                 self.freeze_encoder()
-                
-                # Reduce alignment loss weight (soft constraint, not structural rewrite)
-                print(f"\n⚖️  Reducing alignment loss weight:")
-                print(f"  λ_attn: {self.lambda_attn} → {self.lambda_attn_alignment}")
-                print(f"  ranking_margin: {self.ranking_margin} → {self.ranking_margin_alignment}")
-                self.lambda_attn = self.lambda_attn_alignment
-                self.ranking_margin = self.ranking_margin_alignment
                 
                 # Extract model discoveries
                 print("\n🔍 Extracting model-discovered rationales...")
