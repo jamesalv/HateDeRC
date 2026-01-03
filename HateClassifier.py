@@ -387,6 +387,14 @@ class HateClassifier:
         patience_counter = 0
         early_stopping_patience = getattr(self.config, "early_stopping_patience", 0)
 
+        # Disable early stopping and best model checkpointing for multi-stage training
+        if self.use_multistage_training:
+            print(
+                "  ⚠ Multi-stage training: Early stopping and best model checkpointing DISABLED"
+            )
+            print("  Model will train for all epochs to complete both stages\n")
+            early_stopping_patience = 0  # Disable early stopping
+
         for epoch in range(self.config.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
 
@@ -419,30 +427,44 @@ class HateClassifier:
             print(f"  Val Acc:    {val_accuracy:.4f}")
             print(f"  Val F1:     {val_f1:.4f}")
 
-            # Save best model
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-                patience_counter = 0  # Reset patience counter
-                self.save_model("best_model")
-                print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
-            else:
-                patience_counter += 1
-                print(
-                    f"  No improvement (patience: {patience_counter}/{early_stopping_patience})"
-                )
+            # Best model tracking and early stopping (disabled for multi-stage training)
+            if not self.use_multistage_training:
+                # Save best model
+                if val_f1 > best_f1:
+                    best_f1 = val_f1
+                    patience_counter = 0  # Reset patience counter
+                    self.save_model("best_model")
+                    print(f"  ✓ New best model saved! (F1: {best_f1:.4f})")
+                else:
+                    patience_counter += 1
+                    print(
+                        f"  No improvement (patience: {patience_counter}/{early_stopping_patience})"
+                    )
 
-                # Early stopping check
-                if (
-                    early_stopping_patience > 0
-                    and patience_counter >= early_stopping_patience
-                ):
+                    # Early stopping check
+                    if (
+                        early_stopping_patience > 0
+                        and patience_counter >= early_stopping_patience
+                    ):
+                        print(
+                            f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs."
+                        )
+                        print(
+                            f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})"
+                        )
+                        break
+            else:
+                # For multi-stage training: track best but don't save intermediate checkpoints
+                if val_f1 > best_f1:
+                    best_f1 = val_f1
                     print(
-                        f"\n  ⚠ Early stopping triggered! No improvement for {early_stopping_patience} epochs."
+                        f"  📈 New best F1: {best_f1:.4f} (not saved - multistage mode)"
                     )
-                    print(
-                        f"  Best F1: {best_f1:.4f} (Epoch {epoch + 1 - patience_counter})"
-                    )
-                    break
+
+        # Save final model after multi-stage training completes
+        if self.use_multistage_training:
+            self.save_model("final_model")
+            print(f"\n  ✓ Final model saved after completing multi-stage training!")
 
         self.save_history()
 
