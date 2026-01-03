@@ -38,8 +38,16 @@ class TrainingConfig:
     use_multistage_training: bool = False  # Enable exploration → discovery → alignment
     entropy_only_epochs: int = 3  # Stage 1: Entropy exploration epochs
     attention_alignment_epochs: int = 2  # Stage 2: Attention alignment epochs
-    model_rationale_topk: int = 5  # Top-k model-discovered tokens to extract
-    model_rationale_threshold: float = 0.4  # Scale factor for model rationales (0-1)
+    model_rationale_topk: int = (
+        2  # Top-k model-discovered tokens (reduced for stability)
+    )
+    model_rationale_threshold: float = (
+        0.2  # Scale factor for model rationales (reduced for stability)
+    )
+    lambda_attn_alignment: float = (
+        0.01  # Lighter weight for alignment phase (soft constraint)
+    )
+    ranking_margin_alignment: float = 0.05  # Softer margin for alignment phase
 
     # Optimization Parameters
     use_amp: bool = True  # Automatic Mixed Precision (2-3x speedup on GPU)

@@ -159,6 +159,8 @@ class ExperimentManager:
             "attention_alignment_epochs": config.attention_alignment_epochs,
             "model_rationale_topk": config.model_rationale_topk,
             "model_rationale_threshold": config.model_rationale_threshold,
+            "lambda_attn_alignment": config.lambda_attn_alignment,
+            "ranking_margin_alignment": config.ranking_margin_alignment,
             # Optimization Parameters
             "use_amp": config.use_amp,
             "gradient_accumulation_steps": config.gradient_accumulation_steps,

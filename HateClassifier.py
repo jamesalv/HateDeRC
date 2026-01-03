@@ -86,11 +86,15 @@ class HateClassifier:
         self.attention_alignment_epochs = getattr(
             config, "attention_alignment_epochs", 2
         )
-        self.model_rationale_topk = getattr(config, "model_rationale_topk", 5)
+        self.model_rationale_topk = getattr(config, "model_rationale_topk", 2)  # Reduced from 5
         self.model_rationale_threshold = getattr(
-            config, "model_rationale_threshold", 0.4
+            config, "model_rationale_threshold", 0.2  # Reduced from 0.4
         )
         self.augmented_rationales = None  # Will store human + model rationales
+        
+        # Stage-specific attention loss weights
+        self.lambda_attn_alignment = getattr(config, "lambda_attn_alignment", 0.01)  # Lighter for alignment
+        self.ranking_margin_alignment = getattr(config, "ranking_margin_alignment", 0.05)  # Softer margin
 
         # Move model to device
         self.model.to(self.device)
@@ -282,6 +286,29 @@ class HateClassifier:
 
         return total_loss / num_batches
 
+    def freeze_encoder(self):
+        """
+        Freeze encoder parameters during alignment phase.
+        
+        This ensures that:
+        - Token representations are locked (from entropy exploration)
+        - Classification boundary remains stable
+        - Only attention distributions can be reshaped
+        - Alignment becomes explanation calibration, not feature rewriting
+        """
+        frozen_params = 0
+        total_params = 0
+        
+        for name, param in self.model.named_parameters():
+            total_params += 1
+            # Freeze everything except the classification head
+            if "classifier" not in name:
+                param.requires_grad = False
+                frozen_params += 1
+        
+        print(f"  🔒 Encoder frozen: {frozen_params}/{total_params} parameters locked")
+        print(f"  Only classification head remains trainable for alignment")
+
     def evaluate(self, val_dataloader):
         self.model.eval()
 
@@ -365,12 +392,14 @@ class HateClassifier:
                 f"    Stage 1 (Epochs 1-{self.entropy_only_epochs}): Entropy Exploration"
             )
             print(f"      - Spread attention across tokens (α={self.alpha_entropy})")
+            print(f"      - Full model training")
             print(
                 f"    Stage 2 (Epochs {self.entropy_only_epochs + 1}-{self.entropy_only_epochs + self.attention_alignment_epochs}): Attention Alignment"
             )
             print(f"      - Extract top-{self.model_rationale_topk} model discoveries")
             print(f"      - Augment with threshold={self.model_rationale_threshold}")
-            print(f"      - Align to human + model rationales (λ={self.lambda_attn})")
+            print(f"      - Align to human + model rationales (λ={self.lambda_attn_alignment})")
+            print(f"      - Encoder FROZEN (only attention reshaping)")
         else:
             print(f"  Attention supervision: {self.train_attention}")
             if self.train_attention:
@@ -403,7 +432,20 @@ class HateClassifier:
                 print("\n" + "=" * 60)
                 print("🔍 STAGE TRANSITION: Entropy Exploration → Attention Alignment")
                 print("=" * 60)
-                print("Extracting model-discovered rationales...")
+                
+                # CRITICAL: Freeze encoder to prevent representation drift
+                print("\n🔒 Freezing encoder...")
+                self.freeze_encoder()
+                
+                # Reduce alignment loss weight (soft constraint, not structural rewrite)
+                print(f"\n⚖️  Reducing alignment loss weight:")
+                print(f"  λ_attn: {self.lambda_attn} → {self.lambda_attn_alignment}")
+                print(f"  ranking_margin: {self.ranking_margin} → {self.ranking_margin_alignment}")
+                self.lambda_attn = self.lambda_attn_alignment
+                self.ranking_margin = self.ranking_margin_alignment
+                
+                # Extract model discoveries
+                print("\n🔍 Extracting model-discovered rationales...")
                 self.augment_rationales_with_model_discoveries(train_dataloader)
                 print("✓ Rationales augmented! Proceeding to alignment phase.")
                 print("=" * 60 + "\n")
@@ -855,6 +897,8 @@ class HateClassifier:
             return torch.tensor(0.0, device=human_rationales.device)
 
         avg_loss = total_loss / total_pairs
+        # lambda_attn is reduced during alignment phase to prevent representation drift
+        # This ensures alignment = soft constraint, not structural rewrite
         return self.lambda_attn * avg_loss
 
     def augment_rationales_with_model_discoveries(self, train_dataloader):
@@ -970,14 +1014,19 @@ class HateClassifier:
         original_highlighted = (all_human_rationales > 0).sum().item()
         augmented_highlighted = (augmented > 0).sum().item()
         added_tokens = augmented_highlighted - original_highlighted
+        avg_added = added_tokens / all_human_rationales.shape[0]
 
         print(f"\n📊 Augmentation Statistics:")
         print(f"  Original human-highlighted tokens: {original_highlighted}")
         print(f"  Augmented total highlighted tokens: {augmented_highlighted}")
         print(f"  Model-discovered tokens added: {added_tokens}")
-        print(
-            f"  Average tokens added per sample: {added_tokens / all_human_rationales.shape[0]:.2f}"
-        )
+        print(f"  Average tokens added per sample: {avg_added:.2f}")
+        
+        # Warn if rationales are too dense
+        if avg_added > 2.0:
+            print(f"\n  ⚠️  WARNING: Augmented rationales may be too dense!")
+            print(f"  Recommended: avg ≤ 1.5 tokens/sample")
+            print(f"  Consider reducing model_rationale_topk or threshold")
 
         self.model.train()
 
