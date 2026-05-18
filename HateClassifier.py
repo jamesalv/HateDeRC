@@ -57,8 +57,12 @@ class HateClassifier:
             output_attentions=True,
             hidden_dropout_prob=config.hidden_dropout_prob,
         )
+        # attn_implementation="eager" is required: the default SDPA kernel
+        # returns attentions=None when output_attentions=True is requested at
+        # forward time, which silently zeroes the attention ranking loss and
+        # all downstream XAI/entropy.
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            config.model_name, config=model_config
+            config.model_name, config=model_config, attn_implementation="eager"
         )
 
         self.lambda_attn = getattr(
@@ -529,8 +533,12 @@ class HateClassifier:
         """Load model checkpoint."""
         load_path = Path(self.config.save_dir) / name
 
-        # Load model (includes classification head)
-        self.model = AutoModelForSequenceClassification.from_pretrained(load_path)
+        # Load model (includes classification head). Force eager attention so
+        # predict(return_attentions=True) actually returns attention weights —
+        # a reloaded checkpoint otherwise defaults to SDPA and yields None.
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            load_path, attn_implementation="eager"
+        )
         self.model.to(self.device)
 
         # Load optimizer state
